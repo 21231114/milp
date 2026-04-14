@@ -347,7 +347,7 @@ class PredictionHead(nn.Module):
     so the model effectively learns  "LP solution + correction".
     """
 
-    def __init__(self, d: int, dropout: float = 0.1):
+    def __init__(self, d: int, dropout: float = 0.1, lp_gate_bias: float = 2.0):
         super().__init__()
         self.shared = nn.Sequential(
             nn.LayerNorm(d),
@@ -359,10 +359,9 @@ class PredictionHead(nn.Module):
         self.continuous_head = nn.Linear(d, 1)   # value
 
         # Learnable gate for LP skip (how much to trust LP vs learned)
-        # Bias initialised to +2 so sigmoid(2)≈0.88 → start by trusting LP
-        # (LP relaxation is already ~66% accurate, good warm-start prior)
+        # sigmoid(bias) controls initial trust: 2.0 → ~88%, 0.0 → 50%
         self.lp_gate = nn.Linear(d, 1)
-        nn.init.constant_(self.lp_gate.bias, 2.0)
+        nn.init.constant_(self.lp_gate.bias, lp_gate_bias)
 
     # ── public helpers ───────────────────────────────────────────────────
 
@@ -445,7 +444,7 @@ class MILPGNNModel(nn.Module):
 
     def __init__(self, hidden_dim: int = 64, n_gcn_layers: int = 2,
                  n_probes: int = 16, n_heads: int = 4,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, lp_gate_bias: float = 2.0):
         super().__init__()
         # ---- feature normalizer ----
         self.normalizer = FeatureNormalizer()
@@ -465,7 +464,7 @@ class MILPGNNModel(nn.Module):
         self.sd_fusion = StaticDynamicFusion(hidden_dim)
 
         # ---- prediction ----
-        self.pred_head = PredictionHead(hidden_dim, dropout)
+        self.pred_head = PredictionHead(hidden_dim, dropout, lp_gate_bias)
 
         self._init_weights()
 

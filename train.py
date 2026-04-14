@@ -103,6 +103,13 @@ DEFAULTS = {
     "batch_size": None,
     "warmup_epochs": 5,
     "problems": ["CA", "IP", "IS", "SC", "WA"],
+    # Fixed-weight baseline (GradNorm disabled)
+    "w_sup": 1.0,
+    "w_viol": 0.1,
+    "w_recon": 0.0,
+    "w_orth": 0.0,
+    # LP skip connection initial trust
+    "lp_gate_bias": 2.0,
 }
 
 
@@ -221,7 +228,7 @@ def lagrangian_loss(per_con_viol, lambdas, obj_norm):
 #  Training & Validation
 # ══════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, dataset, balancer, lag_mgr,
+def train_one_epoch(model, dataset, loss_fn, lag_mgr,
                     optimizer, device, cfg, epoch=0):
     model.train()
     indices = list(range(len(dataset)))
@@ -251,15 +258,11 @@ def train_one_epoch(model, dataset, balancer, lag_mgr,
 
             # ── forward ──
             out = model(vf, cf, ei, ev, return_aux=True)
-            base = balancer(out, data, model)
+            base = loss_fn(out, data, model)
 
             # Reuse pre-computed per-constraint violations from base loss
             viols = base["per_con_viol"]
             lag = lagrangian_loss(viols, lambdas, obj_norm=base["obj_loss"])
-
-            # ── GradNorm weight update (once per batch, on first instance) ──
-            if j == 0:
-                balancer.step(base, model)
 
             # ── Lagrangian warmup ──
             warmup_epochs = max(1, int(cfg["epochs"] * 0.1))
@@ -281,14 +284,8 @@ def train_one_epoch(model, dataset, balancer, lag_mgr,
                 meters[k] += base[k].item()
 
         # ── optimizer step (once per batch) ──
-        # FIX: prevent optimizer from double-updating GradNorm weights
-        if hasattr(balancer, 'log_w') and balancer.log_w.grad is not None:
-            balancer.log_w.grad = None
-
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
         optimizer.step()
-
-        # (batch-level progress removed — epoch-level summary only)
 
     return {k: v / n for k, v in meters.items()}
 
@@ -427,6 +424,18 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--warmup_epochs", type=int, default=5,
                         help="Number of linear warmup epochs before cosine decay.")
+    parser.add_argument("--w_sup", type=float, default=1.0,
+                        help="Fixed weight for supervised loss.")
+    parser.add_argument("--w_viol", type=float, default=0.1,
+                        help="Fixed weight for STE constraint-violation loss.")
+    parser.add_argument("--w_recon", type=float, default=0.0,
+                        help="Fixed weight for reconstruction loss (0 = disabled).")
+    parser.add_argument("--w_orth", type=float, default=0.0,
+                        help="Fixed weight for orthogonality loss (0 = disabled).")
+    parser.add_argument("--lp_gate_bias", type=float, default=2.0,
+                        help="Initial bias for LP skip-connection gate. "
+                             "sigmoid(bias) sets initial LP trust: "
+                             "2.0→88%%, 0.0→50%%, -2.0→12%%.")
     args = parser.parse_args()
 
     cfg = {**DEFAULTS, **vars(args)}
@@ -460,20 +469,28 @@ def main():
         hidden_dim=cfg["hidden_dim"],
         n_probes=cfg["n_probes"],
         dropout=cfg["dropout"],
+        lp_gate_bias=cfg["lp_gate_bias"],
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n_params:,}")  # before logger
 
-    # ── loss ──
-    base_loss = MILPCompositeLoss(hidden_dim=cfg["hidden_dim"]).to(device)
-    balancer  = GradNormBalancer(base_loss, alpha=cfg["gradnorm_alpha"]).to(device)
+    # ── loss (fixed weights, no GradNorm) ──
+    base_loss = MILPCompositeLoss(
+        hidden_dim=cfg["hidden_dim"],
+        w_sup=cfg["w_sup"],
+        w_viol=cfg["w_viol"],
+        w_recon=cfg["w_recon"],
+        w_orth=cfg["w_orth"],
+        w_entropy=0.0,
+    ).to(device)
+    balancer = base_loss   # alias — fixed weights, no learnable balancer
 
     # ── Lagrangian ──
     lag_mgr = LagrangianManager(lr=cfg["lagrangian_lr"])
 
     # ── optimiser + scheduler (warmup + cosine) ──
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(balancer.parameters()),
+        model.parameters(),
         lr=cfg["lr"], weight_decay=1e-4)
 
     warmup_epochs = cfg["warmup_epochs"]
@@ -527,9 +544,10 @@ def main():
         # log train
         for k, v in train_m.items():
             writer.add_scalar(f"train/{k}", v, epoch)
-        w = balancer.weight_dict()
+        w = {"sup": cfg["w_sup"], "viol": cfg["w_viol"],
+             "recon": cfg["w_recon"], "orth": cfg["w_orth"], "entropy": 0.0}
         for k, v in w.items():
-            writer.add_scalar(f"gradnorm/{k}", v, epoch)
+            writer.add_scalar(f"weights/{k}", v, epoch)
         writer.add_scalar("lagrangian/mean_lambda", lag_mgr.mean_lambda(), epoch)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
@@ -537,7 +555,7 @@ def main():
         logger.info(f"\n  Train  total={train_m['total']:.4f}  sup={train_m['sup']:.4f}  "
               f"lag={train_m['lag']:.4f}  viol={train_m['viol_mean']:.5f}  "
               f"[{elapsed:.0f}s]")
-        logger.info(f"  GradNorm weights: {w}")
+        logger.info(f"  Fixed weights: {w}")
 
         # ---- validate ----
         if val_set and len(val_set) > 0:
@@ -569,7 +587,7 @@ def main():
                 f"viol_rate={val_m.get('viol_rate',0):.4f}  "
                 f"viol_mag={val_m.get('viol_mag',0):.4f}  "
                 f"obj_gap={val_m.get('obj_gap',0):.4f}\n"
-                f"  GN    | {gn_str}\n"
+                f"  Weights | {gn_str}\n"
                 f"  Lag   | mean_lambda={lag_mgr.mean_lambda():.4f}  "
                 f"best_val={best_val_loss:.4f}  no_improve={no_improve}\n"
                 f"{'-'*70}\n"
@@ -601,7 +619,7 @@ def main():
                 f"viol={train_m.get('viol',0):.4f}  orth={train_m.get('orth',0):.4f}  "
                 f"recon={train_m.get('recon',0):.4f}  entropy={train_m.get('entropy',0):.4f}  "
                 f"lag={train_m['lag']:.4f}  viol_mean={train_m['viol_mean']:.5f}\n"
-                f"  GN    | {gn_str}\n"
+                f"  Weights | {gn_str}\n"
                 f"  Lag   | mean_lambda={lag_mgr.mean_lambda():.4f}\n"
                 f"{'-'*70}\n"
             )
