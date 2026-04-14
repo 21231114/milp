@@ -89,6 +89,7 @@ def setup_logger(run_path: str) -> logging.Logger:
 # ── Default hyperparameters ──────────────────────────────────────────────
 DEFAULTS = {
     "hidden_dim": 64,
+    "n_gcn_layers": 2,
     "n_probes": 16,
     "dropout": 0.1,
     "lr": 1e-3,
@@ -409,6 +410,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--n_gcn_layers", type=int, default=2,
+                        help="Number of GCN message-passing rounds per stream (default 2).")
     parser.add_argument("--n_probes", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=15)
@@ -475,6 +478,7 @@ def main():
     # ── model ──
     model = MILPGNNModel(
         hidden_dim=cfg["hidden_dim"],
+        n_gcn_layers=cfg["n_gcn_layers"],
         n_probes=cfg["n_probes"],
         dropout=cfg["dropout"],
         lp_gate_bias=cfg["lp_gate_bias"],

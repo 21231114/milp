@@ -21,6 +21,8 @@ Usage
 -----
     python inference.py --checkpoint runs/run_001/best.pt --problems CA IP
     python inference.py --checkpoint best.pt --delta 40 --no_confidence_weight
+    python inference.py --checkpoint best.pt --conf_threshold 0.9
+    python inference.py --checkpoint best.pt --fix_vars --fix_threshold 0.97
 """
 
 import os
@@ -139,7 +141,7 @@ DEFAULT_DELTA = {
     "CA": 40, "IP": 55, "IS": 40, "SC": 200, "WA": 100,
 }
 
-INSTANCE_DIR = "/home/lmh/autodl-tmp/data/l2o_milp_test"
+INSTANCE_DIR = "/home/lmh/autodl-tmp/data/l2o_milp"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -152,6 +154,7 @@ def load_model(checkpoint_path, device):
     cfg = ckpt.get("cfg", {})
     model = MILPGNNModel(
         hidden_dim=cfg.get("hidden_dim", 64),
+        n_gcn_layers=cfg.get("n_gcn_layers", 2),
         n_probes=cfg.get("n_probes", 16),
         dropout=cfg.get("dropout", 0.1),
     ).to(device)
@@ -166,7 +169,10 @@ def load_model(checkpoint_path, device):
 
 def build_trust_region_instance(inst_file, pred_info, delta,
                                 use_confidence_weight=True,
-                                min_weight=0.05):
+                                min_weight=0.05,
+                                conf_threshold=0.9,
+                                fix_vars=False,
+                                fix_threshold=0.97):
     """
     Load the original MILP from inst_file, add trust-region constraints
     based on pred_info, and return the modified pyscipopt Model.
@@ -179,12 +185,22 @@ def build_trust_region_instance(inst_file, pred_info, delta,
     delta                 : float trust-region radius
     use_confidence_weight : bool  anisotropic (True) or uniform (False) TR
     min_weight            : float minimum confidence weight
+    conf_threshold        : float only include a variable in the trust region
+                                  if its confidence >= this value (default 0.9).
+                                  Binary confidence = |P(x=1) - 0.5| * 2 in [0,1].
+                                  Integer confidence = 1 - 2*frac in [0,1].
+    fix_vars              : bool  if True, instead of a trust-region constraint,
+                                  variables whose confidence >= fix_threshold are
+                                  fixed to their predicted value (equality bound).
+                                  Variables below fix_threshold are excluded entirely.
+    fix_threshold         : float confidence threshold used when fix_vars=True
+                                  (default 0.97).
 
     Returns
     -------
-    model  : pyscipopt.Model  (modified, not yet solved)
-    n_bin  : int  number of binary variables in trust region
-    n_int  : int  number of integer variables in trust region
+    model   : pyscipopt.Model  (modified, not yet solved)
+    n_bin   : int  number of binary variables added to trust region / fixed
+    n_int   : int  number of integer variables added to trust region / fixed
     """
     var_feats   = pred_info["var_feats"]
     var_names   = pred_info["var_names"]
@@ -206,70 +222,110 @@ def build_trust_region_instance(inst_file, pred_info, delta,
     scip_vars.sort(key=lambda v: v.name)
     var_map = {v.name: v for v in scip_vars}
 
-    # ── Binary variables: confidence-weighted local branching ──
+    # Select the active threshold depending on mode
+    active_threshold = fix_threshold if fix_vars else conf_threshold
+
+    # ── Binary variables ──────────────────────────────────────────────────
+    n_bin_active = 0
     if len(bin_indices) > 0:
         probs     = binary_prob[bin_indices]
         x_hat_bin = (probs > 0.5).astype(float)
 
-        conf = np.abs(probs - 0.5)           # [0, 0.5]
-        if use_confidence_weight:
-            conf_w = np.clip(conf * 2.0, min_weight, 1.0)
+        # Binary confidence: distance from 0.5, scaled to [0, 1]
+        conf_bin = np.abs(probs - 0.5) * 2.0   # [0, 1]
+
+        if fix_vars:
+            # Fix variables whose confidence >= fix_threshold
+            for j, idx in enumerate(bin_indices):
+                if conf_bin[j] < active_threshold:
+                    continue
+                name = var_names[idx]
+                if name not in var_map:
+                    continue
+                gv = var_map[name]
+                val = float(x_hat_bin[j])
+                model.chgVarLb(gv, val)
+                model.chgVarUb(gv, val)
+                n_bin_active += 1
         else:
-            conf_w = np.ones(len(bin_indices))
-
-        terms = []
-        for j, idx in enumerate(bin_indices):
-            name = var_names[idx]
-            if name not in var_map:
-                continue
-            gv = var_map[name]
-            w  = float(conf_w[j])
-            if x_hat_bin[j] == 1.0:
-                # penalty for flipping to 0: w * (1 - x)
-                terms.append(w * (1.0 - gv))
+            # Trust-region: only include variables above conf_threshold
+            if use_confidence_weight:
+                conf_w = np.clip(conf_bin, min_weight, 1.0)
             else:
-                # penalty for flipping to 1: w * x
-                terms.append(w * gv)
+                conf_w = np.ones(len(bin_indices))
 
-        if terms:
-            model.addCons(
-                scip_io.quicksum(terms) <= delta,
-                name="trust_binary"
-            )
+            terms = []
+            for j, idx in enumerate(bin_indices):
+                if conf_bin[j] < active_threshold:
+                    continue
+                name = var_names[idx]
+                if name not in var_map:
+                    continue
+                gv = var_map[name]
+                w  = float(conf_w[j])
+                if x_hat_bin[j] == 1.0:
+                    terms.append(w * (1.0 - gv))
+                else:
+                    terms.append(w * gv)
+                n_bin_active += 1
 
-    # ── Integer variables: L1 linearisation ──
+            if terms:
+                model.addCons(
+                    scip_io.quicksum(terms) <= delta,
+                    name="trust_binary"
+                )
+
+    # ── Integer variables ─────────────────────────────────────────────────
+    n_int_active = 0
     if len(int_indices) > 0:
         x_hat_int = np.round(integer_mu[int_indices]).astype(float)
         frac      = np.abs(integer_mu[int_indices] - x_hat_int)
-        conf_int  = 1.0 - np.clip(frac, 0.0, 0.5) * 2.0
-        if use_confidence_weight:
-            w_int = np.clip(conf_int, min_weight, 1.0)
+        conf_int  = 1.0 - np.clip(frac, 0.0, 0.5) * 2.0   # [0, 1]
+
+        if fix_vars:
+            for j, idx in enumerate(int_indices):
+                if conf_int[j] < active_threshold:
+                    continue
+                name = var_names[idx]
+                if name not in var_map:
+                    continue
+                gv  = var_map[name]
+                val = float(x_hat_int[j])
+                model.chgVarLb(gv, val)
+                model.chgVarUb(gv, val)
+                n_int_active += 1
         else:
-            w_int = np.ones(len(int_indices))
+            if use_confidence_weight:
+                w_int_arr = np.clip(conf_int, min_weight, 1.0)
+            else:
+                w_int_arr = np.ones(len(int_indices))
 
-        aux_vars = []
-        weights  = []
-        for j, idx in enumerate(int_indices):
-            name   = var_names[idx]
-            if name not in var_map:
-                continue
-            gv     = var_map[name]
-            x_hat  = float(x_hat_int[j])
-            w      = float(w_int[j])
+            aux_vars = []
+            weights  = []
+            for j, idx in enumerate(int_indices):
+                if conf_int[j] < active_threshold:
+                    continue
+                name = var_names[idx]
+                if name not in var_map:
+                    continue
+                gv    = var_map[name]
+                x_hat = float(x_hat_int[j])
+                w     = float(w_int_arr[j])
 
-            d = model.addVar(name=f"_tr_d_{name}", vtype="C", lb=0.0)
-            model.addCons(d >= gv - x_hat, name=f"_tr_up_{name}")
-            model.addCons(d >= x_hat - gv, name=f"_tr_dn_{name}")
-            aux_vars.append(d)
-            weights.append(w)
+                d = model.addVar(name=f"_tr_d_{name}", vtype="C", lb=0.0)
+                model.addCons(d >= gv - x_hat, name=f"_tr_up_{name}")
+                model.addCons(d >= x_hat - gv, name=f"_tr_dn_{name}")
+                aux_vars.append(d)
+                weights.append(w)
+                n_int_active += 1
 
-        if aux_vars:
-            model.addCons(
-                scip_io.quicksum(w * d for w, d in zip(weights, aux_vars)) <= delta,
-                name="trust_integer"
-            )
+            if aux_vars:
+                model.addCons(
+                    scip_io.quicksum(w * d for w, d in zip(weights, aux_vars)) <= delta,
+                    name="trust_integer"
+                )
 
-    return model, len(bin_indices), len(int_indices)
+    return model, n_bin_active, n_int_active
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -356,6 +412,7 @@ def export_problem(gnn_model, problem, args, device):
     print(f"{'='*60}")
 
     sum_feat = sum_infer = sum_total = 0.0
+    sum_bin = sum_int = 0
     count = 0
 
     for i, (stem, inst_file, cache_path) in enumerate(instances):
@@ -399,6 +456,9 @@ def export_problem(gnn_model, problem, args, device):
         model, n_bin, n_int = build_trust_region_instance(
             inst_file, pred_info, delta,
             use_confidence_weight=not args.no_confidence_weight,
+            conf_threshold=args.conf_threshold,
+            fix_vars=args.fix_vars,
+            fix_threshold=args.fix_threshold,
         )
         out_path = os.path.join(out_dir, stem + "_modified.mps")
         model.writeProblem(out_path)
@@ -408,6 +468,8 @@ def export_problem(gnn_model, problem, args, device):
         sum_feat  += feat_time
         sum_infer += infer_time
         sum_total += total_time
+        sum_bin   += n_bin
+        sum_int   += n_int
         count += 1
 
         print(f"  [{i+1:>3d}/{len(instances)}] {stem}  "
@@ -417,7 +479,13 @@ def export_problem(gnn_model, problem, args, device):
               f"total={total_time:.3f}s  -> {os.path.basename(out_path)}")
 
     if count > 0:
+        thr = args.fix_threshold if args.fix_vars else args.conf_threshold
+        mode_label = f"fix_threshold={thr}" if args.fix_vars else f"conf_threshold={thr}"
         print(f"\n  Summary ({count} instances):")
+        print(f"    Confidence filter  : {mode_label}")
+        print(f"    Vars in threshold  : "
+              f"avg_bin={sum_bin/count:.1f}  avg_int={sum_int/count:.1f}  "
+              f"avg_total={(sum_bin+sum_int)/count:.1f}")
         print(f"    Feature extraction : total={sum_feat:.3f}s  "
               f"avg={sum_feat/count:.3f}s")
         print(f"    GNN inference      : total={sum_infer:.3f}s  "
@@ -445,6 +513,16 @@ def main():
                         help="Trust-region radius (-1 = per-problem default)")
     parser.add_argument("--no_confidence_weight", action="store_true",
                         help="Use uniform weights instead of confidence-based")
+    parser.add_argument("--conf_threshold", type=float, default=0.9,
+                        help="Minimum confidence for a variable to enter the trust "
+                             "region (default 0.9).  Binary: |P(x=1)-0.5|*2; "
+                             "Integer: 1 - 2*frac.")
+    parser.add_argument("--fix_vars", action="store_true",
+                        help="Instead of a trust-region constraint, fix high-confidence "
+                             "variables to their predicted value (equality bound). "
+                             "Uses --fix_threshold to decide which vars to fix.")
+    parser.add_argument("--fix_threshold", type=float, default=0.97,
+                        help="Confidence threshold for --fix_vars mode (default 0.97).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir",
                         default=os.path.join(SCRIPT_DIR, "output"),
@@ -466,6 +544,7 @@ def main():
     model, cfg = load_model(args.checkpoint, device)
     print(f"Model loaded from {args.checkpoint}")
     print(f"  hidden_dim={cfg.get('hidden_dim', 64)}  "
+          f"n_gcn_layers={cfg.get('n_gcn_layers', 2)}  "
           f"n_probes={cfg.get('n_probes', 16)}")
 
     os.makedirs(args.output_dir, exist_ok=True)
