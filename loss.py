@@ -115,37 +115,23 @@ class MILPCompositeLoss(nn.Module):
 
     def _supervised_loss(self, model_out, sols, objs, var_feats, minimise):
         """
-        Dynamic-temperature Boltzmann supervised loss over ALL solutions.
-
-        Uses all K (e.g. 50) solutions weighted by a dynamic Boltzmann
-        temperature derived from the mean gap between solutions and the best
-        one.  This ensures the weight ratio between average-quality and
-        best-quality solutions stays constant regardless of the absolute
-        objective scale.
-
-        Dynamic temperature:  T = mean_gap / ln(1/alpha)
-        where alpha is the desired weight ratio of mean-quality vs best solution.
-        With alpha=0.05, ln(1/0.05) ≈ 3.0, so the mean-quality solution gets
-        ~5% of the best solution's weight.
+        仅使用最优解（Best Solution）作为监督信号的损失函数。
         """
         is_bin, is_int, is_cont = _type_masks(var_feats)
         K, N = sols.shape
         device = sols.device
         eps = self.label_smoothing
 
-        # ── Step 1: Dynamic Boltzmann weights over ALL solutions ──
-        sign = 1.0 if minimise else -1.0
-
-        objs_shifted = sign * objs
-        objs_shifted = objs_shifted - objs_shifted.min()   # best → 0, worse → larger
-
-        mean_gap = objs_shifted.mean()
-        # alpha=0.05 → ln(1/0.05) ≈ 3.0 : mean solution gets ~5% of best's weight
-        dynamic_temp = (mean_gap / 3.0) + 1e-8
-
-        boltz_w = F.softmax(-objs_shifted / dynamic_temp, dim=0)  # [K]
+        # ── Step 1: 提取唯一的最优解 ──
+        if minimise:
+            best_idx = objs.argmin()
+        else:
+            best_idx = objs.argmax()
+        
+        best_sol = sols[best_idx]  # 仅提取最好的解，形状变为 [N]
 
         # ── Step 2: Variable-type weights ──
+        # 仍然使用所有解来计算整数变量的极差（为了归一化权重），这样比较稳妥
         var_w = torch.zeros(N, device=device)
         var_w[is_bin] = self.type_w_bin
 
@@ -158,35 +144,30 @@ class MILPCompositeLoss(nn.Module):
 
         var_w = var_w / (var_w.sum() + 1e-8) * N              # normalise, mean=1
 
-        # ── Step 3: Per-variable per-solution loss ──
-        per_var_loss = torch.zeros(K, N, device=device)
+        # ── Step 3: 仅针对最优解计算 Per-variable loss ──
+        # 不再有 K 维度，直接计算一维 [N] 的损失
+        per_var_loss = torch.zeros(N, device=device)
 
         if is_bin.any():
             logits = model_out["binary_logits"][is_bin]
-            targets = sols[:, is_bin]
+            targets = best_sol[is_bin]
             targets = targets * (1.0 - eps) + 0.5 * eps        # label smoothing
-            per_var_loss[:, is_bin] = F.binary_cross_entropy_with_logits(
-                logits.unsqueeze(0).expand_as(targets),
-                targets, reduction="none")
+            per_var_loss[is_bin] = F.binary_cross_entropy_with_logits(
+                logits, targets, reduction="none")
 
         if is_int.any():
             mu  = model_out["integer_mu"][is_int]
             lsd = model_out["integer_log_std"][is_int]
-            per_var_loss[:, is_int] = -PredictionHead.integer_log_prob(
-                mu.unsqueeze(0).expand(K, -1),
-                lsd.unsqueeze(0).expand(K, -1),
-                sols[:, is_int])
+            per_var_loss[is_int] = -PredictionHead.integer_log_prob(
+                mu, lsd, best_sol[is_int])
 
         if is_cont.any():
             val = model_out["continuous_val"][is_cont]
-            per_var_loss[:, is_cont] = F.mse_loss(
-                val.unsqueeze(0).expand(K, -1),
-                sols[:, is_cont], reduction="none")
+            per_var_loss[is_cont] = F.mse_loss(
+                val, best_sol[is_cont], reduction="none")
 
-        # weighted mean: variables then Boltzmann over solutions
-        per_sol = (per_var_loss * var_w.unsqueeze(0)).mean(dim=1)   # [K]
-        return (boltz_w * per_sol).sum()
-
+        # 变量加权平均即可，不再需要对多解进行 Boltzmann 加权
+        return (per_var_loss * var_w).mean()
     # ══════════════════════════════════════════════════════════════════════
     #  2.  STE + constraint violation + objective
     # ══════════════════════════════════════════════════════════════════════
