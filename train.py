@@ -110,6 +110,8 @@ DEFAULTS = {
     "w_orth": 0.0,
     # LP skip connection initial trust
     "lp_gate_bias": 2.0,
+    # Validation metric for early stopping
+    "val_metric": "acc",
 }
 
 
@@ -436,6 +438,12 @@ def main():
                         help="Initial bias for LP skip-connection gate. "
                              "sigmoid(bias) sets initial LP trust: "
                              "2.0→88%%, 0.0→50%%, -2.0→12%%.")
+    parser.add_argument("--val_metric", type=str, default="acc",
+                        choices=["acc", "sup", "viol"],
+                        help="Validation metric for early stopping and best model selection. "
+                             "'acc'=binary accuracy (higher is better, default), "
+                             "'sup'=supervised loss (lower is better), "
+                             "'viol'=constraint violation loss (lower is better).")
     args = parser.parse_args()
 
     cfg = {**DEFAULTS, **vars(args)}
@@ -520,11 +528,14 @@ def main():
 
     # ── resume ──
     start_epoch = 0
-    best_val_loss = float("inf")
+    val_metric = cfg["val_metric"]
+    # For 'acc': higher is better → track best as highest; init to -inf
+    # For 'sup'/'viol': lower is better → track best as lowest; init to +inf
+    best_val_metric = float("-inf") if val_metric == "acc" else float("inf")
     if cfg["resume"]:
-        start_epoch, best_val_loss, _ = load_checkpoint(
+        start_epoch, best_val_metric, _ = load_checkpoint(
             cfg["resume"], model, optimizer, scheduler, balancer, lag_mgr)
-        logger.info(f"Resumed from epoch {start_epoch}, best_val={best_val_loss:.4f}")
+        logger.info(f"Resumed from epoch {start_epoch}, best_val_{val_metric}={best_val_metric:.4f}")
 
     # ── training loop ──
     no_improve = 0
@@ -589,19 +600,30 @@ def main():
                 f"obj_gap={val_m.get('obj_gap',0):.4f}\n"
                 f"  Weights | {gn_str}\n"
                 f"  Lag   | mean_lambda={lag_mgr.mean_lambda():.4f}  "
-                f"best_val={best_val_loss:.4f}  no_improve={no_improve}\n"
+                f"best_val_{val_metric}={best_val_metric:.4f}  no_improve={no_improve}\n"
                 f"{'-'*70}\n"
             )
             epoch_log_fh.flush()
 
             # ---- early stopping / best model ----
-            if val_sup < best_val_loss:
-                best_val_loss = val_sup
+            # Determine current metric value and improvement direction
+            if val_metric == "acc":
+                current_metric = val_m.get("binary_acc", 0.0)
+                improved = current_metric > best_val_metric
+            elif val_metric == "sup":
+                current_metric = val_sup
+                improved = current_metric < best_val_metric
+            else:  # viol
+                current_metric = val_m["loss/viol"]
+                improved = current_metric < best_val_metric
+
+            if improved:
+                best_val_metric = current_metric
                 save_checkpoint(
                     os.path.join(run_path, "best.pt"),
                     model, optimizer, scheduler, balancer, lag_mgr,
-                    epoch, best_val_loss, cfg)
-                logger.info(f"  >> New best model saved (val_loss={best_val_loss:.4f})")
+                    epoch, best_val_metric, cfg)
+                logger.info(f"  >> New best model saved (val_{val_metric}={best_val_metric:.4f})")
                 no_improve = 0
             else:
                 no_improve += 1
@@ -630,16 +652,16 @@ def main():
             save_checkpoint(
                 os.path.join(run_path, f"epoch_{epoch+1:03d}.pt"),
                 model, optimizer, scheduler, balancer, lag_mgr,
-                epoch, best_val_loss, cfg)
+                epoch, best_val_metric, cfg)
 
     # ── final ──
     save_checkpoint(
         os.path.join(run_path, "last.pt"),
         model, optimizer, scheduler, balancer, lag_mgr,
-        epoch, best_val_loss, cfg)
+        epoch, best_val_metric, cfg)
     epoch_log_fh.close()
     writer.close()
-    logger.info(f"\nTraining complete.  Best val loss: {best_val_loss:.4f}")
+    logger.info(f"\nTraining complete.  Best val_{val_metric}: {best_val_metric:.4f}")
     logger.info(f"Logs & checkpoints: {run_path}")
     logger.info(f"Epoch metrics log: {epoch_log_path}")
 
