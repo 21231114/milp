@@ -139,7 +139,7 @@ DEFAULT_DELTA = {
     "CA": 40, "IP": 55, "IS": 40, "SC": 200, "WA": 100,
 }
 
-INSTANCE_DIR = "/home/lmh/autodl-tmp/data/l2o_milp"
+INSTANCE_DIR = "/home/lmh/autodl-tmp/data/l2o_milp_test"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -447,9 +447,17 @@ def main():
                         help="Use uniform weights instead of confidence-based")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir",
-                        default=os.path.join(SCRIPT_DIR, "inference_results"),
+                        default=os.path.join(SCRIPT_DIR, "output"),
                         help="Root directory for exported .mps files")
     args = parser.parse_args()
+
+    # Derive run folder name from checkpoint path and append to output_dir.
+    # Expected layout: .../runs/run_XXX/best.pt  -> run_XXX
+    # Walk up the checkpoint path to find a component that starts with "run_".
+    ckpt_parts = os.path.normpath(os.path.abspath(args.checkpoint)).split(os.sep)
+    run_name = next((p for p in reversed(ckpt_parts) if p.startswith("run_")), None)
+    if run_name:
+        args.output_dir = os.path.join(args.output_dir, run_name)
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

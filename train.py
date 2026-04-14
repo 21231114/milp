@@ -648,7 +648,7 @@ def main():
             epoch_log_fh.flush()
 
         # periodic checkpoint
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 50 == 0:
             save_checkpoint(
                 os.path.join(run_path, f"epoch_{epoch+1:03d}.pt"),
                 model, optimizer, scheduler, balancer, lag_mgr,
