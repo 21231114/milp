@@ -4,12 +4,12 @@ loss.py — Multi-objective composite loss for MILP GNN
 
 Components
 ----------
-1. **Supervised loss** (Boltzmann-weighted over 50 solutions, type-aware)
+1. **Supervised loss** (dynamic-temperature Boltzmann over all solutions, type-aware)
    - Binary:     BCE with label smoothing
    - Integer:    discretised-logistic NLL
    - Continuous: MSE
    - Variable-type weighting: binary > small-range int > large-range int > cont
-   - Solution weighting: Boltzmann energy  w_k ∝ exp(−obj_k / T)
+   - Solution weighting: dynamic Boltzmann  T = mean_gap / ln(1/α), α=0.05
 
 2. **STE + constraint violation**
    - Straight-through round for discrete variables
@@ -76,15 +76,11 @@ class MILPCompositeLoss(nn.Module):
     w_orth           : float  weight for Q_macro orthogonality        (0.01)
     w_recon          : float  weight for reconstruction loss          (0.1)
     w_entropy        : float  weight for binary entropy regulariser   (0.01)
-    boltzmann_temp   : float  Boltzmann temperature (auto-scaled)     (1.0)
     label_smoothing  : float  label smoothing for binary BCE          (0.01)
     type_w_bin       : float  variable-type weight for binary vars    (1.0)
     type_w_int       : float  base weight for integer vars            (0.8)
     type_w_cont      : float  weight for continuous vars              (0.3)
-    top_k            : int    only supervise against the k solutions  (5)
-                              closest to the current prediction
-                              (avoids "averaging collapse")
-    minimise         : bool   True = lower objective is better        (True)
+    minimise         : bool   fallback when data has no minimise key  (True)
     """
 
     def __init__(self, hidden_dim: int,
@@ -93,12 +89,10 @@ class MILPCompositeLoss(nn.Module):
                  w_orth: float = 0.01,
                  w_recon: float = 0.1,
                  w_entropy: float = 0.01,
-                 boltzmann_temp: float = 1.0,
                  label_smoothing: float = 0.01,
                  type_w_bin: float = 1.0,
                  type_w_int: float = 0.8,
                  type_w_cont: float = 0.3,
-                 top_k: int = 5,
                  minimise: bool = True):
         super().__init__()
         self.w_sup = w_sup
@@ -106,12 +100,10 @@ class MILPCompositeLoss(nn.Module):
         self.w_orth = w_orth
         self.w_recon = w_recon
         self.w_entropy = w_entropy
-        self.boltzmann_temp = boltzmann_temp
         self.label_smoothing = label_smoothing
         self.type_w_bin = type_w_bin
         self.type_w_int = type_w_int
         self.type_w_cont = type_w_cont
-        self.top_k = top_k
         self.minimise = minimise
 
         # LayerNorm used in reconstruction loss
@@ -121,47 +113,39 @@ class MILPCompositeLoss(nn.Module):
     #  1.  Supervised loss
     # ══════════════════════════════════════════════════════════════════════
 
-    def _supervised_loss(self, model_out, sols, objs, var_feats):
+    def _supervised_loss(self, model_out, sols, objs, var_feats, minimise):
         """
-        Best-matching + Boltzmann supervised loss.
+        Dynamic-temperature Boltzmann supervised loss over ALL solutions.
 
-        Instead of averaging over all 50 solutions (which causes the model to
-        predict 0.5 for ambiguous variables), we:
-        1. Rank solutions by similarity to the current prediction (L1 distance).
-        2. Keep only the top-k closest solutions.
-        3. Weight them by Boltzmann energy (objective quality).
-        This avoids the "averaging collapse" problem.
+        Uses all K (e.g. 50) solutions weighted by a dynamic Boltzmann
+        temperature derived from the mean gap between solutions and the best
+        one.  This ensures the weight ratio between average-quality and
+        best-quality solutions stays constant regardless of the absolute
+        objective scale.
+
+        Dynamic temperature:  T = mean_gap / ln(1/alpha)
+        where alpha is the desired weight ratio of mean-quality vs best solution.
+        With alpha=0.05, ln(1/0.05) ≈ 3.0, so the mean-quality solution gets
+        ~5% of the best solution's weight.
         """
         is_bin, is_int, is_cont = _type_masks(var_feats)
         K, N = sols.shape
         device = sols.device
         eps = self.label_smoothing
 
-        # ── Step 1: find top-k solutions closest to current prediction ──
-        with torch.no_grad():
-            pred = model_out["pred"].detach()                  # [N]
-            dist = (sols - pred.unsqueeze(0)).abs().mean(dim=1)  # [K]
-            # combine distance with objective quality
-            sign = 1.0 if self.minimise else -1.0
-            objs_norm = sign * objs
-            objs_norm = (objs_norm - objs_norm.min()) / (
-                objs_norm.max() - objs_norm.min() + 1e-6)
-            # score = -distance - lambda*obj  (lower is better)
-            score = -dist - 0.5 * objs_norm
-            top_idx = score.topk(min(self.top_k, K)).indices   # [top_k]
+        # ── Step 1: Dynamic Boltzmann weights over ALL solutions ──
+        sign = 1.0 if minimise else -1.0
 
-        sols_k = sols[top_idx]                                 # [top_k, N]
-        objs_k = objs[top_idx]                                # [top_k]
-        Kk = sols_k.size(0)
+        objs_shifted = sign * objs
+        objs_shifted = objs_shifted - objs_shifted.min()   # best → 0, worse → larger
 
-        # ── Step 2: Boltzmann weights over selected solutions ──
-        objs_shifted = sign * objs_k
-        objs_shifted = objs_shifted - objs_shifted.min()
-        obj_range = objs_shifted.max().clamp(min=1e-6)
-        boltz_w = F.softmax(-objs_shifted / (self.boltzmann_temp * obj_range),
-                            dim=0)                             # [top_k]
+        mean_gap = objs_shifted.mean()
+        # alpha=0.05 → ln(1/0.05) ≈ 3.0 : mean solution gets ~5% of best's weight
+        dynamic_temp = (mean_gap / 3.0) + 1e-8
 
-        # ── Step 3: Variable-type weights ──
+        boltz_w = F.softmax(-objs_shifted / dynamic_temp, dim=0)  # [K]
+
+        # ── Step 2: Variable-type weights ──
         var_w = torch.zeros(N, device=device)
         var_w[is_bin] = self.type_w_bin
 
@@ -174,12 +158,12 @@ class MILPCompositeLoss(nn.Module):
 
         var_w = var_w / (var_w.sum() + 1e-8) * N              # normalise, mean=1
 
-        # ── Step 4: Per-variable per-solution loss ──
-        per_var_loss = torch.zeros(Kk, N, device=device)
+        # ── Step 3: Per-variable per-solution loss ──
+        per_var_loss = torch.zeros(K, N, device=device)
 
         if is_bin.any():
             logits = model_out["binary_logits"][is_bin]
-            targets = sols_k[:, is_bin]
+            targets = sols[:, is_bin]
             targets = targets * (1.0 - eps) + 0.5 * eps        # label smoothing
             per_var_loss[:, is_bin] = F.binary_cross_entropy_with_logits(
                 logits.unsqueeze(0).expand_as(targets),
@@ -189,18 +173,18 @@ class MILPCompositeLoss(nn.Module):
             mu  = model_out["integer_mu"][is_int]
             lsd = model_out["integer_log_std"][is_int]
             per_var_loss[:, is_int] = -PredictionHead.integer_log_prob(
-                mu.unsqueeze(0).expand(Kk, -1),
-                lsd.unsqueeze(0).expand(Kk, -1),
-                sols_k[:, is_int])
+                mu.unsqueeze(0).expand(K, -1),
+                lsd.unsqueeze(0).expand(K, -1),
+                sols[:, is_int])
 
         if is_cont.any():
             val = model_out["continuous_val"][is_cont]
             per_var_loss[:, is_cont] = F.mse_loss(
-                val.unsqueeze(0).expand(Kk, -1),
-                sols_k[:, is_cont], reduction="none")
+                val.unsqueeze(0).expand(K, -1),
+                sols[:, is_cont], reduction="none")
 
         # weighted mean: variables then Boltzmann over solutions
-        per_sol = (per_var_loss * var_w.unsqueeze(0)).mean(dim=1)   # [top_k]
+        per_sol = (per_var_loss * var_w.unsqueeze(0)).mean(dim=1)   # [K]
         return (boltz_w * per_sol).sum()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -208,7 +192,7 @@ class MILPCompositeLoss(nn.Module):
     # ══════════════════════════════════════════════════════════════════════
 
     def _ste_violation_loss(self, model_out, var_feats, con_feats,
-                           edge_index, edge_values, objs):
+                           edge_index, edge_values, objs, minimise):
         """
         Compute constraint violation and objective quality using STE-rounded
         predictions.  Uses raw (ecole-normalised) coefficients and bias.
@@ -246,9 +230,9 @@ class MILPCompositeLoss(nn.Module):
         raw_obj = var_feats[:, _COL_RAW_OBJ]                   # un-normalised
         obj_pred = (raw_obj * x_ste).sum()
 
-        obj_best  = objs.min() if self.minimise else objs.max()
+        obj_best  = objs.min() if minimise else objs.max()
         obj_range = (objs.max() - objs.min()).clamp(min=1e-6)
-        if self.minimise:
+        if minimise:
             loss_obj = (obj_pred - obj_best) / obj_range
         else:
             loss_obj = (obj_best - obj_pred) / obj_range
@@ -333,17 +317,18 @@ class MILPCompositeLoss(nn.Module):
         ev   = data["edge_values"].to(device)
         sols = data["sols"].to(device)
         objs = data["objs"].to(device)
+        minimise = data.get("minimise", self.minimise)
 
         is_bin, _, _ = _type_masks(vf)
 
         losses = {}
 
         # 1. Supervised
-        losses["sup"] = self._supervised_loss(model_out, sols, objs, vf)
+        losses["sup"] = self._supervised_loss(model_out, sols, objs, vf, minimise)
 
         # 2. STE + constraint violation (returns scalar loss + per-constraint violations + obj_loss)
         losses["viol"], losses["per_con_viol"], losses["obj_loss"] = \
-            self._ste_violation_loss(model_out, vf, cf, ei, ev, objs)
+            self._ste_violation_loss(model_out, vf, cf, ei, ev, objs, minimise)
 
         # 3. Orthogonality
         losses["orth"] = self._orthogonality_loss(model.attention.Q_macro)

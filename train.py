@@ -55,6 +55,11 @@ from loss import (MILPCompositeLoss, GradNormBalancer,
 # ── Per-problem default batch sizes (same as baseline) ───────────────────
 TASK_BATCH_SIZE = {"CA": 4, "WA": 4, "IP": 4, "IS": 4, "SC": 1}
 
+# ── Per-problem objective sense ──────────────────────────────────────────
+# True = lower objective is better (minimisation problem)
+# False = higher objective is better (maximisation problem)
+MINIMISE_MAP = {"CA": False, "IP": False, "IS": False, "SC": True, "WA": True}
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Logging utilities
@@ -108,8 +113,10 @@ DEFAULTS = {
 class MILPDataset:
     """Lazy-loading dataset of processed .pkl instances."""
 
-    def __init__(self, file_paths):
-        self.files = sorted(file_paths)
+    def __init__(self, file_tuples):
+        """file_tuples: list of (file_path, problem_type) sorted by path."""
+        self.files = [t[0] for t in file_tuples]
+        self.prob_types = [t[1] for t in file_tuples]
 
     def __len__(self):
         return len(self.files)
@@ -117,6 +124,7 @@ class MILPDataset:
     def __getitem__(self, idx):
         with open(self.files[idx], "rb") as f:
             d = pickle.load(f)
+        prob = self.prob_types[idx]
         return {
             "var_feats":   torch.as_tensor(d["var_feats"],   dtype=torch.float32),
             "con_feats":   torch.as_tensor(d["con_feats"],   dtype=torch.float32),
@@ -127,6 +135,7 @@ class MILPDataset:
             "n_vars":      d["n_vars"],
             "n_cons":      d["n_cons"],
             "instance_id": os.path.basename(self.files[idx]),
+            "minimise":    MINIMISE_MAP.get(prob, True),
         }
 
 
@@ -136,9 +145,10 @@ def collect_files(data_dir, problems, split):
     for prob in problems:
         d = os.path.join(data_dir, prob, split)
         if os.path.isdir(d):
-            files.extend(
-                os.path.join(d, f) for f in os.listdir(d) if f.endswith(".pkl"))
-    return sorted(files)
+            for f in os.listdir(d):
+                if f.endswith(".pkl"):
+                    files.append((os.path.join(d, f), prob))
+    return sorted(files, key=lambda x: x[0])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -278,15 +288,7 @@ def train_one_epoch(model, dataset, balancer, lag_mgr,
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
         optimizer.step()
 
-        batch_end = batch_start + actual_bs
-        if batch_end % max(n // 5, 1) == 0 or batch_end == n:
-            elapsed = time.time() - t0
-            avg_total = meters["total"] / batch_end
-            logging.getLogger("milp_train").info(
-                f"  [{batch_end:>4d}/{n}]  total={avg_total:.4f}  "
-                f"sup={meters['sup']/batch_end:.4f}  "
-                f"lag={meters['lag']/batch_end:.4f}  "
-                f"viol={meters['viol_mean']/batch_end:.5f}  {elapsed:.0f}s")
+        # (batch-level progress removed — epoch-level summary only)
 
     return {k: v / n for k, v in meters.items()}
 
@@ -317,8 +319,10 @@ def validate(model, dataset, base_loss, device):
         pred = out["pred"]
 
         # binary accuracy  (vs best Gurobi solution)
+        minimise = data.get("minimise", True)
         if is_bin.any():
-            best_sol = sols[objs.argmin()]
+            best_idx = objs.argmin() if minimise else objs.argmax()
+            best_sol = sols[best_idx]
             acc = ((pred[is_bin] > 0.5).float() == best_sol[is_bin]).float().mean()
             meters["binary_acc"] += acc.item()
 
@@ -340,9 +344,12 @@ def validate(model, dataset, base_loss, device):
         # objective gap  (penalised if infeasible)
         is_feasible = (v.max() < 1e-6)
         obj_pred = (vf[:, _COL_RAW_OBJ] * x).sum()
-        obj_best = objs.min()
+        obj_best = objs.min() if minimise else objs.max()
         obj_range = (objs.max() - objs.min()).clamp(min=1e-6)
-        raw_gap = ((obj_pred - obj_best) / obj_range).item()
+        if minimise:
+            raw_gap = ((obj_pred - obj_best) / obj_range).item()
+        else:
+            raw_gap = ((obj_best - obj_pred) / obj_range).item()
         # infeasible solutions get penalty = max(1, gap) + viol_sum
         if is_feasible:
             meters["obj_gap"] += max(0.0, raw_gap)
@@ -487,7 +494,8 @@ def main():
     run_path = os.path.join(cfg["run_dir"], f"run_{run_id:03d}")
     os.makedirs(run_path, exist_ok=True)
     writer = SummaryWriter(log_dir=run_path)
-    csv_log = CSVLogger(os.path.join(run_path, "training_log.csv"))
+    epoch_log_path = os.path.join(run_path, "epoch_metrics.log")
+    epoch_log_fh = open(epoch_log_path, "w")
     logger = setup_logger(run_path)
     with open(os.path.join(run_path, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2, default=str)
@@ -546,40 +554,27 @@ def main():
                   f"viol_rate={val_m.get('viol_rate',0):.4f}  "
                   f"obj_gap={val_m.get('obj_gap',0):.4f}")
 
-            # ── CSV logging: one row per epoch with all metrics ──
-            csv_row = {
-                "epoch": epoch + 1,
-                "lr": cur_lr,
-                "elapsed_s": round(elapsed, 1),
-                # train losses
-                "train_total": round(train_m["total"], 6),
-                "train_sup": round(train_m["sup"], 6),
-                "train_viol": round(train_m.get("viol", 0), 6),
-                "train_orth": round(train_m.get("orth", 0), 6),
-                "train_recon": round(train_m.get("recon", 0), 6),
-                "train_entropy": round(train_m.get("entropy", 0), 6),
-                "train_lag": round(train_m["lag"], 6),
-                "train_viol_mean": round(train_m["viol_mean"], 6),
-                # val metrics
-                "val_total": round(val_total, 6),
-                "val_sup": round(val_m.get("loss/sup", 0), 6),
-                "val_viol": round(val_m.get("loss/viol", 0), 6),
-                "val_orth": round(val_m.get("loss/orth", 0), 6),
-                "val_recon": round(val_m.get("loss/recon", 0), 6),
-                "val_entropy": round(val_m.get("loss/entropy", 0), 6),
-                "val_binary_acc": round(val_m.get("binary_acc", 0), 6),
-                "val_feasible_rate": round(val_m.get("feasible_rate", 0), 6),
-                "val_viol_rate": round(val_m.get("viol_rate", 0), 6),
-                "val_viol_mag": round(val_m.get("viol_mag", 0), 6),
-                "val_obj_gap": round(val_m.get("obj_gap", 0), 6),
-                # GradNorm weights
-                **{f"gn_w_{k}": round(v, 6) for k, v in w.items()},
-                # Lagrangian
-                "mean_lambda": round(lag_mgr.mean_lambda(), 6),
-                "best_val_loss": round(best_val_loss, 6),
-                "no_improve": no_improve,
-            }
-            csv_log.log(csv_row)
+            # ── Epoch metrics log ──
+            gn_str = "  ".join(f"{k}={v:.4f}" for k, v in w.items())
+            epoch_log_fh.write(
+                f"Epoch {epoch+1:>3d}/{cfg['epochs']}  "
+                f"lr={cur_lr:.6f}  elapsed={elapsed:.0f}s\n"
+                f"  Train | total={train_m['total']:.4f}  sup={train_m['sup']:.4f}  "
+                f"viol={train_m.get('viol',0):.4f}  orth={train_m.get('orth',0):.4f}  "
+                f"recon={train_m.get('recon',0):.4f}  entropy={train_m.get('entropy',0):.4f}  "
+                f"lag={train_m['lag']:.4f}  viol_mean={train_m['viol_mean']:.5f}\n"
+                f"  Val   | total={val_total:.4f}  sup={val_sup:.4f}  "
+                f"acc={val_m.get('binary_acc',0):.4f}  "
+                f"feasible={val_m.get('feasible_rate',0):.1%}  "
+                f"viol_rate={val_m.get('viol_rate',0):.4f}  "
+                f"viol_mag={val_m.get('viol_mag',0):.4f}  "
+                f"obj_gap={val_m.get('obj_gap',0):.4f}\n"
+                f"  GN    | {gn_str}\n"
+                f"  Lag   | mean_lambda={lag_mgr.mean_lambda():.4f}  "
+                f"best_val={best_val_loss:.4f}  no_improve={no_improve}\n"
+                f"{'-'*70}\n"
+            )
+            epoch_log_fh.flush()
 
             # ---- early stopping / best model ----
             if val_sup < best_val_loss:
@@ -597,23 +592,20 @@ def main():
                           f"without improvement.")
                     break
         else:
-            # No validation set — still log training metrics to CSV
-            csv_row = {
-                "epoch": epoch + 1,
-                "lr": cur_lr,
-                "elapsed_s": round(elapsed, 1),
-                "train_total": round(train_m["total"], 6),
-                "train_sup": round(train_m["sup"], 6),
-                "train_viol": round(train_m.get("viol", 0), 6),
-                "train_orth": round(train_m.get("orth", 0), 6),
-                "train_recon": round(train_m.get("recon", 0), 6),
-                "train_entropy": round(train_m.get("entropy", 0), 6),
-                "train_lag": round(train_m["lag"], 6),
-                "train_viol_mean": round(train_m["viol_mean"], 6),
-                **{f"gn_w_{k}": round(v, 6) for k, v in w.items()},
-                "mean_lambda": round(lag_mgr.mean_lambda(), 6),
-            }
-            csv_log.log(csv_row)
+            # No validation set — still log training metrics
+            gn_str = "  ".join(f"{k}={v:.4f}" for k, v in w.items())
+            epoch_log_fh.write(
+                f"Epoch {epoch+1:>3d}/{cfg['epochs']}  "
+                f"lr={cur_lr:.6f}  elapsed={elapsed:.0f}s\n"
+                f"  Train | total={train_m['total']:.4f}  sup={train_m['sup']:.4f}  "
+                f"viol={train_m.get('viol',0):.4f}  orth={train_m.get('orth',0):.4f}  "
+                f"recon={train_m.get('recon',0):.4f}  entropy={train_m.get('entropy',0):.4f}  "
+                f"lag={train_m['lag']:.4f}  viol_mean={train_m['viol_mean']:.5f}\n"
+                f"  GN    | {gn_str}\n"
+                f"  Lag   | mean_lambda={lag_mgr.mean_lambda():.4f}\n"
+                f"{'-'*70}\n"
+            )
+            epoch_log_fh.flush()
 
         # periodic checkpoint
         if (epoch + 1) % 10 == 0:
@@ -627,11 +619,11 @@ def main():
         os.path.join(run_path, "last.pt"),
         model, optimizer, scheduler, balancer, lag_mgr,
         epoch, best_val_loss, cfg)
-    csv_log.close()
+    epoch_log_fh.close()
     writer.close()
     logger.info(f"\nTraining complete.  Best val loss: {best_val_loss:.4f}")
     logger.info(f"Logs & checkpoints: {run_path}")
-    logger.info(f"CSV log: {os.path.join(run_path, 'training_log.csv')}")
+    logger.info(f"Epoch metrics log: {epoch_log_path}")
 
 
 if __name__ == "__main__":
