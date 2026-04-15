@@ -2,31 +2,43 @@
 model.py — GNN + Macro-Micro Bidirectional Attention for MILP
 =============================================================
 
-Architecture
-------------
+Architecture (Transolver-style slice/deslice)
+----------------------------------------------
 1. Feature split & embedding
    var_feats [N,21] -> static [N,9]  -> BipartiteGCN -> static_out  [N,d]
                     -> dynamic [N,12] -> BipartiteGCN -> dynamic_out [N,d]
 
-2. Macro-Micro bidirectional attention  (Task 3)
-   static_out  -> W_k -> K_micro          Q_macro [M,d] (learnable, orthogonal)
-   dynamic_out -> W_v -> V_micro
-   S = Q @ K^T * log(N) / sqrt(d)       [M, N]  (size-adaptive temperature)
-   A_fwd = softmax(S, dim=N)              -> H_macro = A_fwd @ V   [M, d]
-   H_post = SelfAttn + FFN (pre-norm)     [M, d]
-   A_bwd = softmax(S^T, dim=M)            -> H_feedback = A_bwd @ W_v_back(H_post)
+2. Macro-Micro bidirectional attention  (Transolver slice/deslice)
+   K_micro = W_k(static_out)     [N, d]
+   V_dyn   = W_v(dynamic_out)    [N, d]
+   V_sta   = W_vs(static_out)    [N, d]
 
-3. Micro-Macro gated fusion  (Task 4)
-   S_i = sum_m  w_m * A_fwd[m,i] * N    w_m = ||H_macro_m||  (N-rescaled)
-   c_i = sigmoid(gamma * S_i + beta)
-   V_updated = c * H_feedback + (1-c) * dynamic_out
+   Slice weights (key fix: softmax over M-dim, NOT N-dim):
+     S_raw = Q_macro @ K^T / sqrt(d)          [M, N]
+     W     = softmax(S_raw, dim=0)             [M, N]  each node sums to 1 over probes
+     W_norm = W / (W.sum(dim=1, keepdim=True) + eps)   per-probe normalised
 
-4. Static-Dynamic gated fusion  (Task 4)
-   alpha = sigmoid(W_gate · [static_out || V_updated])
-   Feature_final = alpha * V_updated + (1-alpha) * static_out
+   Slice (micro -> macro):
+     H_macro_dyn = W_norm @ V_dyn             [M, d]
+     H_macro_sta = W_norm @ V_sta             [M, d]   (static aggregation by probes)
 
-5. Type-aware prediction head  (Task 4)
-   Binary     -> P(x=1)  via sigmoid
+   Macro Self-Attention (pre-norm Transformer block on M tokens):
+     H_post_dyn, H_post_sta = SelfAttn+FFN on each
+
+   Deslice (macro -> micro, same weights W):
+     H_feedback_dyn = W^T @ H_post_dyn        [N, d]
+     H_feedback_sta = W^T @ H_post_sta        [N, d]   (static feedback)
+
+3. Micro-Macro gated fusion
+   c_i = sigmoid(gamma * importance_i + beta)
+   V_updated = c * H_feedback_dyn + (1-c) * dynamic_out
+
+4. Static-Dynamic gated fusion (now incorporates static macro feedback)
+   alpha = sigmoid(W_gate · [static_feedback || V_updated || static_out])
+   Feature_final = alpha * V_updated + (1-alpha) * (static_out + static_feedback)
+
+5. Type-aware prediction head
+   Binary     -> P(x=1)  via sigmoid  (+LP skip)
    Integer    -> discretised logistic  (mu, sigma)
    Continuous -> direct value
 """
@@ -199,15 +211,23 @@ class BipartiteGCN(nn.Module):
 
 class MacroMicroAttention(nn.Module):
     """
-    Forward  (micro->macro):  M probes aggregate over N variable nodes
-    Self-attn:                multi-head self-attention on macro vectors
-    Backward (macro->micro):  redistribute refined macro info to micro
+    Transolver-style slice/deslice attention.
+
+    Key design (fixes attention dilution for large N):
+      - Slice weights W[M,N] are obtained by softmax over the M-dimension,
+        NOT the N-dimension.  Each variable node distributes its "membership"
+        across M probes (options = M, not N), so high-confidence assignments
+        are easy even when N >> M.
+      - Normalised weighted-average (divide by per-probe weight sum) for
+        both dynamic and static streams.
+      - Same weight matrix W reused for deslice (Transolver Eq.2 & 4).
 
     Returns
     -------
-    H_feedback : [N, d]
-    A_forward  : [M, N]   (needed by MicroMacroFusion)
-    H_macro    : [M, d]   (needed by MicroMacroFusion for norm weights)
+    H_feedback_dyn : [N, d]   dynamic macro feedback redistributed to micro
+    H_feedback_sta : [N, d]   static  macro feedback redistributed to micro
+    W              : [M, N]   slice weights (softmax over M, no dropout)
+    H_macro_dyn    : [M, d]   refined dynamic macro tokens
     """
 
     def __init__(self, d: int, n_probes: int = 16,
@@ -215,59 +235,102 @@ class MacroMicroAttention(nn.Module):
         super().__init__()
         self.d = d
         self.scale = math.sqrt(d)
+        self.n_probes = n_probes
 
+        # Learnable orthogonal probes (macro query vectors)
         self.Q_macro = nn.Parameter(torch.empty(n_probes, d))
         nn.init.orthogonal_(self.Q_macro)
 
+        # Projection for key (from static stream)
         self.W_k = nn.Linear(d, d)
-        self.W_v = nn.Linear(d, d)
+        # Projection for dynamic value
+        self.W_v_dyn = nn.Linear(d, d)
+        # Projection for static value (new: static stream also sliced)
+        self.W_v_sta = nn.Linear(d, d)
 
-        # macro self-attention  (pre-norm transformer block)
-        self.sa_norm = nn.LayerNorm(d)
-        self.self_attn = nn.MultiheadAttention(
+        # --- Macro self-attention for dynamic tokens (pre-norm) ---
+        self.sa_norm_dyn = nn.LayerNorm(d)
+        self.self_attn_dyn = nn.MultiheadAttention(
             d, n_heads, dropout=dropout, batch_first=True)
-
-        self.ff_norm = nn.LayerNorm(d)
-        self.ffn = nn.Sequential(
+        self.ff_norm_dyn = nn.LayerNorm(d)
+        self.ffn_dyn = nn.Sequential(
             nn.Linear(d, 4 * d), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(4 * d, d), nn.Dropout(dropout))
 
-        self.W_v_back = nn.Linear(d, d)
+        # --- Macro self-attention for static tokens (pre-norm) ---
+        self.sa_norm_sta = nn.LayerNorm(d)
+        self.self_attn_sta = nn.MultiheadAttention(
+            d, n_heads, dropout=dropout, batch_first=True)
+        self.ff_norm_sta = nn.LayerNorm(d)
+        self.ffn_sta = nn.Sequential(
+            nn.Linear(d, 4 * d), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4 * d, d), nn.Dropout(dropout))
+
+        # Back-projection for deslice
+        self.W_out_dyn = nn.Linear(d, d)
+        self.W_out_sta = nn.Linear(d, d)
+
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, K_in: torch.Tensor, V_in: torch.Tensor,
+    # ── helpers ──────────────────────────────────────────────────────────
+
+    def _macro_self_attn(self, H, sa_norm, self_attn, ff_norm, ffn):
+        """Standard pre-norm Transformer block on [M, d] tokens."""
+        h = H.unsqueeze(0)          # [1, M, d]
+        h = h + self_attn(*([sa_norm(h)] * 3))[0]
+        h = h + ffn(ff_norm(h))
+        return h.squeeze(0)         # [M, d]
+
+    # ── forward ──────────────────────────────────────────────────────────
+
+    def forward(self, static_out: torch.Tensor, dynamic_out: torch.Tensor,
                 return_aux: bool = False):
-        K = self.W_k(K_in)                            # [N, d]
-        V = self.W_v(V_in)                            # [N, d]
-        N = K.size(0)
+        """
+        static_out  : [N, d]   output of static  GCN stream
+        dynamic_out : [N, d]   output of dynamic GCN stream
+        """
+        K = self.W_k(static_out)          # [N, d]  key from static
+        V_dyn = self.W_v_dyn(dynamic_out) # [N, d]
+        V_sta = self.W_v_sta(static_out)  # [N, d]
 
-        # ---- forward: micro -> macro ----
-        # Size-adaptive temperature: log(N) sharpens attention for larger
-        # graphs, preventing the softmax from collapsing to uniform.
-        log_n = torch.log(torch.tensor(N, dtype=K.dtype, device=K.device))
-        log_n = log_n.clamp(min=1.0)
-        S = self.Q_macro @ K.t() * log_n / self.scale  # [M, N]
-        A_fwd = F.softmax(S, dim=-1)                   # [M, N]
-        H_macro = self.drop(A_fwd) @ V                 # [M, d]
+        # ── Slice weights: softmax over M-dim (Transolver trick) ──────────
+        # S_raw[m, i] = Q_macro[m] · K[i] / sqrt(d)
+        S_raw = self.Q_macro @ K.t() / self.scale   # [M, N]
 
-        # ---- macro self-attention  (pre-norm) ----
-        h = H_macro.unsqueeze(0)                       # [1, M, d]
-        h_norm = self.sa_norm(h)
-        h_attn, _ = self.self_attn(h_norm, h_norm, h_norm)
-        h = h + h_attn
-        h = h + self.ffn(self.ff_norm(h))
-        H_post = h.squeeze(0)                          # [M, d]
+        # Each variable node assigns membership across M probes.
+        # softmax(dim=0) → W[:, i] sums to 1 for every node i.
+        W = F.softmax(S_raw, dim=0)                  # [M, N]
 
-        # ---- backward: macro -> micro ----
-        A_bwd_clean = F.softmax(S.t(), dim=-1)         # [N, M]  (no dropout)
-        H_feedback = self.drop(A_bwd_clean) @ self.W_v_back(H_post)  # [N, d]
+        # ── Slice: weighted average (normalised by per-probe weight sum) ──
+        # W_sum[m] = sum_i W[m,i]; divide to get proper average, not sum.
+        W_sum = W.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [M, 1]
+        W_norm = W / W_sum                            # [M, N]  normalised
+
+        H_macro_dyn = W_norm @ V_dyn                 # [M, d]
+        H_macro_sta = W_norm @ V_sta                 # [M, d]
+
+        # ── Macro self-attention (probes talk to each other) ─────────────
+        H_post_dyn = self._macro_self_attn(
+            H_macro_dyn, self.sa_norm_dyn, self.self_attn_dyn,
+            self.ff_norm_dyn, self.ffn_dyn)           # [M, d]
+        H_post_sta = self._macro_self_attn(
+            H_macro_sta, self.sa_norm_sta, self.self_attn_sta,
+            self.ff_norm_sta, self.ffn_sta)           # [M, d]
+
+        # ── Deslice: reuse same W (transpose) to broadcast back ──────────
+        # x'_i = sum_m W[m,i] * H_post[m]   (Transolver Eq.4)
+        H_feedback_dyn = W.t() @ self.W_out_dyn(self.drop(H_post_dyn))  # [N, d]
+        H_feedback_sta = W.t() @ self.W_out_sta(self.drop(H_post_sta))  # [N, d]
 
         if return_aux:
-            return H_feedback, A_fwd, H_macro, {
-                "A_backward": A_bwd_clean,
-                "V_micro": V,
+            return H_feedback_dyn, H_feedback_sta, W, H_macro_dyn, {
+                "W_slice": W,               # [M, N]  membership weights
+                "H_macro_dyn": H_macro_dyn, # [M, d]  before self-attn
+                "H_post_dyn": H_post_dyn,   # [M, d]  after  self-attn
+                "H_macro_sta": H_macro_sta,
+                "H_post_sta": H_post_sta,
             }
-        return H_feedback, A_fwd, H_macro
+        return H_feedback_dyn, H_feedback_sta, W, H_macro_dyn
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -276,11 +339,11 @@ class MacroMicroAttention(nn.Module):
 
 class MicroMacroFusion(nn.Module):
     """
-    Gated fusion of macro feedback and micro dynamic features.
+    Gated fusion of dynamic macro feedback and micro dynamic features.
 
-    S_i = sum_m  w_m * A_forward[m, i]     w_m = ||H_macro_m||_2 (normalised)
-    c_i = sigmoid(gamma * S_i + beta)      gamma, beta learnable scalars
-    V_updated_i = c_i * H_feedback_i  +  (1 - c_i) * Micro_Feature_i
+    importance_i = sum_m  W[m, i]  (un-normalised membership entropy proxy)
+    c_i = sigmoid(gamma * importance_i + beta)
+    V_updated_i = c_i * H_feedback_dyn_i  +  (1 - c_i) * dynamic_out_i
     """
 
     def __init__(self):
@@ -288,46 +351,62 @@ class MicroMacroFusion(nn.Module):
         self.gamma = nn.Parameter(torch.tensor(1.0))
         self.beta = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, H_feedback, micro_feat, A_forward, H_macro):
+    def forward(self, H_feedback_dyn, dynamic_out, W, H_macro_dyn):
         """
-        H_feedback : [N, d]
-        micro_feat : [N, d]   (dynamic_out from GCN)
-        A_forward  : [M, N]
-        H_macro    : [M, d]
+        H_feedback_dyn : [N, d]   dynamic macro feedback from deslice
+        dynamic_out    : [N, d]   GCN dynamic stream output
+        W              : [M, N]   slice weights (softmax over M-dim)
+        H_macro_dyn    : [M, d]   macro tokens (used for probe importance)
         """
-        # importance weight per probe: normalised L2 norm
-        w = H_macro.norm(dim=-1)                       # [M]
-        w = w / (w.sum() + 1e-8)                       # [M]  normalised
+        # Probe importance: norm of macro token, normalised
+        w_probe = H_macro_dyn.norm(dim=-1)             # [M]
+        w_probe = w_probe / (w_probe.sum() + 1e-8)     # [M]  normalised
 
-        # per-variable attention importance
-        S_i = (w.unsqueeze(-1) * A_forward).sum(dim=0)  # [N]
-        # Rescale by N: mean(S_i)=1/N without this, making the gate
-        # size-dependent.  After rescaling mean(S_i)≈1 for any N.
-        S_i = S_i * S_i.size(0)
+        # Per-variable importance: how strongly each node is covered
+        importance = (w_probe.unsqueeze(-1) * W).sum(dim=0)  # [N]
+        # Rescale so mean ≈ 1 regardless of N
+        importance = importance * importance.size(0)
 
-        # gated blending
-        c = torch.sigmoid(self.gamma * S_i + self.beta) # [N]
-        c = c.unsqueeze(-1)                             # [N, 1]
-        V_updated = c * H_feedback + (1.0 - c) * micro_feat
-        return V_updated
+        c = torch.sigmoid(self.gamma * importance + self.beta).unsqueeze(-1)  # [N, 1]
+        return c * H_feedback_dyn + (1.0 - c) * dynamic_out
 
 
 class StaticDynamicFusion(nn.Module):
     """
-    Gated fusion of V_updated (dynamic+macro) and static features.
+    Gated fusion incorporating:
+      - V_updated          (dynamic + dynamic-macro feedback)
+      - static_out         (GCN static stream)
+      - H_feedback_sta     (static features re-aggregated via Q_macro probes)
 
-    alpha_i = sigmoid(W_gate · [static_i || V_updated_i])    element-wise [d]
-    Feature_final_i = alpha_i * V_updated_i + (1 - alpha_i) * static_i
+    The static macro feedback lets Q_macro-learned structure guide which
+    static features are emphasised, rather than using all static features
+    uniformly.
+
+    Gate:
+      alpha = sigmoid(W_gate · [V_updated || static_out || H_feedback_sta])
+      static_enhanced = static_out + H_feedback_sta   (residual)
+      Feature_final   = alpha * V_updated + (1 - alpha) * static_enhanced
     """
 
     def __init__(self, d: int):
         super().__init__()
-        self.W_gate = nn.Linear(2 * d, d)
+        # Gate takes concatenation of all three streams
+        self.W_gate = nn.Linear(3 * d, d)
+        # Project static feedback before residual add
+        self.sta_proj = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d))
 
-    def forward(self, V_updated, static_feat):
-        alpha = torch.sigmoid(
-            self.W_gate(torch.cat([static_feat, V_updated], dim=-1)))  # [N, d]
-        return alpha * V_updated + (1.0 - alpha) * static_feat         # [N, d]
+    def forward(self, V_updated, static_out, H_feedback_sta):
+        """
+        V_updated       : [N, d]   micro-macro fused dynamic features
+        static_out      : [N, d]   GCN static stream output
+        H_feedback_sta  : [N, d]   static macro feedback (desliced)
+        """
+        # Enrich static with probe-learned structure
+        static_enhanced = static_out + self.sta_proj(H_feedback_sta)   # [N, d]
+
+        gate_in = torch.cat([V_updated, static_out, H_feedback_sta], dim=-1)
+        alpha = torch.sigmoid(self.W_gate(gate_in))                    # [N, d]
+        return alpha * V_updated + (1.0 - alpha) * static_enhanced     # [N, d]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -497,28 +576,30 @@ class MILPGNNModel(nn.Module):
         dynamic_out, _ = self.dynamic_gcn(
             dynamic_f, con_feats, edge_index, edge_val)
 
-        # 2. Attention  (returns H_feedback, A_forward, H_macro[, aux])
+        # 2. Attention: returns (H_fb_dyn, H_fb_sta, W, H_macro_dyn[, aux])
         if return_aux:
-            H_fb, A_fwd, H_macro, attn_aux = self.attention(
+            H_fb_dyn, H_fb_sta, W, H_macro_dyn, attn_aux = self.attention(
                 static_out, dynamic_out, return_aux=True)
         else:
-            H_fb, A_fwd, H_macro = self.attention(static_out, dynamic_out)
+            H_fb_dyn, H_fb_sta, W, H_macro_dyn = self.attention(
+                static_out, dynamic_out)
 
-        # 3. Micro-Macro gated fusion
-        V_updated = self.mm_fusion(H_fb, dynamic_out, A_fwd, H_macro)
+        # 3. Micro-Macro gated fusion (dynamic stream)
+        V_updated = self.mm_fusion(H_fb_dyn, dynamic_out, W, H_macro_dyn)
 
-        # 4. Static-Dynamic gated fusion
-        Feature_final = self.sd_fusion(V_updated, static_out)
+        # 4. Static-Dynamic gated fusion (now uses static macro feedback)
+        Feature_final = self.sd_fusion(V_updated, static_out, H_fb_sta)
 
         # 5. Type-aware prediction (with LP skip connection)
         result = self.pred_head(Feature_final, var_types, lp_sol)
 
         if return_aux:
             result["aux"] = {
-                **attn_aux,                     # A_backward, V_micro
-                "H_macro": H_macro,             # [M, d]
+                **attn_aux,                     # W_slice, H_macro_dyn/sta, etc.
+                "H_macro_dyn": H_macro_dyn,     # [M, d]
                 "static_out": static_out,       # [N, d]
                 "dynamic_out": dynamic_out,     # [N, d]
+                "H_fb_sta": H_fb_sta,           # [N, d]
             }
         return result
 
@@ -569,14 +650,16 @@ class MILPGNNModel(nn.Module):
         dynamic_out, _ = self.dynamic_gcn(
             dynamic_f, con_feats, edge_index, edge_val)
 
-        # Attention + micro-macro fusion must run per-graph
+        # Attention + fusion must run per-graph (global pooling is graph-specific)
         V_updated = torch.zeros_like(static_out)
+        H_fb_sta_all = torch.zeros_like(static_out)
         for gid in var_batch.unique():
             mask = var_batch == gid
             s_g, d_g = static_out[mask], dynamic_out[mask]
-            H_fb, A_fwd, H_macro = self.attention(s_g, d_g)
-            V_updated[mask] = self.mm_fusion(H_fb, d_g, A_fwd, H_macro)
+            H_fb_dyn, H_fb_sta, W, H_macro_dyn = self.attention(s_g, d_g)
+            V_updated[mask] = self.mm_fusion(H_fb_dyn, d_g, W, H_macro_dyn)
+            H_fb_sta_all[mask] = H_fb_sta
 
         # Static-dynamic fusion and prediction run on the full batch
-        Feature_final = self.sd_fusion(V_updated, static_out)
+        Feature_final = self.sd_fusion(V_updated, static_out, H_fb_sta_all)
         return self.pred_head(Feature_final, var_types)

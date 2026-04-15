@@ -19,8 +19,8 @@ Components
 3. **Orthogonality regularisation**   ||Q_norm · Q_norm^T − I||_F^2
 
 4. **Reconstruction regularisation**
-   V̂ = A_backward · W_v_back(LayerNorm(H_macro))
-   L_recon = MSE(V_micro, V̂)       (V_micro detached as target)
+   W [M,N] = slice weights (softmax over M)
+   L_recon = MSE(dynamic_out,  W^T @ (W_norm @ dynamic_out))
 
 5. **Entropy regularisation** (extra trick)
    Encourages decisive binary predictions: −mean(p·log p + (1−p)·log(1−p))
@@ -106,7 +106,7 @@ class MILPCompositeLoss(nn.Module):
         self.type_w_cont = type_w_cont
         self.minimise = minimise
 
-        # LayerNorm used in reconstruction loss
+        # LayerNorm used in reconstruction loss (kept for checkpoint compatibility)
         self.recon_norm = nn.LayerNorm(hidden_dim)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -239,16 +239,27 @@ class MILPCompositeLoss(nn.Module):
 
     def _reconstruction_loss(self, aux, model) -> torch.Tensor:
         """
-        V̂ = A_backward · W_v_back(LN(H_macro))
-        L = MSE(V_micro, V̂)
-        V_micro is detached (used as a fixed target).
-        """
-        A_bwd   = aux["A_backward"]                            # [N, M]
-        H_macro = aux["H_macro"]                               # [M, d]
-        V_micro = aux["V_micro"]                               # [N, d]
+        Encourage the slice+deslice cycle to faithfully reconstruct the
+        original dynamic micro features.
 
-        H_normed = self.recon_norm(H_macro)                    # [M, d]
-        V_hat = A_bwd @ model.attention.W_v_back(H_normed)     # [N, d]
+        The slice weights W [M, N] define a soft clustering.  The
+        normalised version W_norm [M, N] compresses N nodes to M macro
+        tokens.  The deslice (W^T) should be able to approximately recover
+        the originals.
+
+        L_recon = MSE(dynamic_out,  W^T @ W_norm @ dynamic_out)
+        Both terms are detached-except-for-the-gradient path through W,
+        so this only trains the probe assignment, not the value network.
+        """
+        W       = aux["W_slice"]        # [M, N]  membership (softmax over M)
+        V_micro = aux["dynamic_out"]    # [N, d]  original dynamic GCN output
+
+        W_sum  = W.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [M, 1]
+        W_norm = W / W_sum                                     # [M, N]
+
+        # Reconstruct: compress then decompress
+        H_compressed = W_norm @ V_micro.detach()              # [M, d]
+        V_hat = W.t() @ H_compressed                          # [N, d]
 
         return F.mse_loss(V_hat, V_micro.detach())
 
@@ -285,7 +296,7 @@ class MILPCompositeLoss(nn.Module):
         data      : dict from the .pkl file with keys:
                     var_feats [N,21], con_feats [C,6], edge_indices [2,E],
                     edge_values [E], sols [K,N], objs [K]
-        model     : MILPGNNModel  (for accessing Q_macro, W_v_back)
+        model     : MILPGNNModel  (for accessing Q_macro)
 
         Returns
         -------

@@ -68,26 +68,25 @@ def forward_with_gates(model: MILPGNNModel, vf, cf, ei, ev):
         static_out,  _ = model.static_gcn(static_f, con_feats, ei, edge_val)
         dynamic_out, _ = model.dynamic_gcn(dynamic_f, con_feats, ei, edge_val)
 
-        # MacroMicro Attention
-        H_fb, A_fwd, H_macro = model.attention(static_out, dynamic_out)
+        # MacroMicro Attention (新接口: 返回 H_fb_dyn, H_fb_sta, W, H_macro_dyn)
+        H_fb_dyn, H_fb_sta, W, H_macro_dyn = model.attention(static_out, dynamic_out)
 
         # MicroMacro Fusion → 提取 c
-        w = H_macro.norm(dim=-1)
-        w = w / (w.sum() + 1e-8)
-        S_i = (w.unsqueeze(-1) * A_fwd).sum(dim=0)  # [N]
-        S_i = S_i * S_i.size(0)
-        c = torch.sigmoid(model.mm_fusion.gamma * S_i + model.mm_fusion.beta)  # [N]
-        c_expand = c.unsqueeze(-1)                                               # [N,1]
-        V_updated = c_expand * H_fb + (1.0 - c_expand) * dynamic_out
+        w_probe = H_macro_dyn.norm(dim=-1)
+        w_probe = w_probe / (w_probe.sum() + 1e-8)
+        importance = (w_probe.unsqueeze(-1) * W).sum(dim=0)  # [N]
+        importance = importance * importance.size(0)
+        c = torch.sigmoid(model.mm_fusion.gamma * importance + model.mm_fusion.beta)  # [N]
+        c_expand = c.unsqueeze(-1)                                                     # [N,1]
+        V_updated = c_expand * H_fb_dyn + (1.0 - c_expand) * dynamic_out
 
-        # StaticDynamic Fusion → 提取 alpha
-        alpha = torch.sigmoid(
-            model.sd_fusion.W_gate(
-                torch.cat([static_out, V_updated], dim=-1)))  # [N, d]
+        # StaticDynamic Fusion (新接口: 3 inputs) → 提取 alpha
+        static_enhanced = static_out + model.sd_fusion.sta_proj(H_fb_sta)
+        gate_in = torch.cat([V_updated, static_out, H_fb_sta], dim=-1)
+        alpha = torch.sigmoid(model.sd_fusion.W_gate(gate_in))                  # [N, d]
 
-        Feature_final = alpha * V_updated + (1.0 - alpha) * static_out
-
-        # 三路贡献（按维度平均后得到 per-variable 标量）
+        # 三路贡献：现在 static_enhanced = static_out + static_macro
+        # 近似地：alpha → 动态流权重，1-alpha → 静态流权重
         alpha_mean = alpha.mean(dim=-1)           # [N]
         contrib_static   = 1.0 - alpha_mean       # [N]
         contrib_dyn_orig = alpha_mean * (1.0 - c) # [N]
