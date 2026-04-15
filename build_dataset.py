@@ -52,6 +52,7 @@ Usage:
     python build_dataset.py                           # process all 5 problems
     python build_dataset.py --problems CA IS          # only specific problems
     python build_dataset.py --seed 42                 # (default seed)
+    python build_dataset.py --workers 8               # parallel workers (default: cpu count)
 """
 
 import os
@@ -60,7 +61,9 @@ import argparse
 import pickle
 import json
 import time
+import gc
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 
@@ -170,6 +173,9 @@ def extract_features(instance_path: str):
     np.nan_to_num(con_feats, copy=False, nan=0.0)
 
     model.freeProb()
+    del model
+    del env
+    gc.collect()
 
     return var_feats, con_feats, edge_indices, edge_values, var_names, binary_vars, raw_obj
 
@@ -218,6 +224,27 @@ def process_instance(problem: str, inst_file: str, inst_path: str):
     }
 
 
+def _worker(args):
+    """Top-level worker function for ProcessPoolExecutor (must be picklable)."""
+    problem, inst_file, inst_path, out_path = args
+    if os.path.exists(out_path):
+        return inst_file, "skip", None
+    t0 = time.time()
+    try:
+        result = process_instance(problem, inst_file, inst_path)
+    except Exception as e:
+        return inst_file, "error", str(e)
+    if result is None:
+        return inst_file, "none", None
+    with open(out_path, "wb") as f:
+        pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+    elapsed = time.time() - t0
+    info = (result["n_vars"], result["n_cons"], result["edge_indices"].shape[1], elapsed)
+    del result
+    gc.collect()
+    return inst_file, "ok", info
+
+
 # ---------------------------------------------------------------------------
 # Train / Val split
 # ---------------------------------------------------------------------------
@@ -243,7 +270,7 @@ def split_instances(instance_files: list, seed: int):
 # Driver
 # ---------------------------------------------------------------------------
 
-def process_problem(problem: str, seed: int):
+def process_problem(problem: str, seed: int, workers: int = 1):
     """Process all instances for one problem type."""
     inst_dir = os.path.join(INSTANCE_DIR, problem)
     if not os.path.isdir(inst_dir):
@@ -253,7 +280,7 @@ def process_problem(problem: str, seed: int):
     # Collect and sort instance files
     inst_files = sorted(os.listdir(inst_dir))
     print(f"\n{'='*60}")
-    print(f"Problem: {problem}  |  instances: {len(inst_files)}")
+    print(f"Problem: {problem}  |  instances: {len(inst_files)}  |  workers: {workers}")
     print(f"{'='*60}")
 
     if len(inst_files) != TRAIN_COUNT + VAL_COUNT:
@@ -278,38 +305,55 @@ def process_problem(problem: str, seed: int):
     # Process each split
     for split_name, file_list in [("train", train_files), ("val", val_files)]:
         print(f"\n--- {split_name}: {len(file_list)} instances ---")
-        success = 0
-        for idx, inst_file in enumerate(file_list):
+        tasks = []
+        for inst_file in file_list:
             stem = os.path.splitext(inst_file)[0]
-            out_path = os.path.join(OUTPUT_DIR, problem, split_name, f"{stem}.pkl")
-
-            if os.path.exists(out_path):
-                success += 1
-                continue
-
-            t0 = time.time()
             inst_path = os.path.join(inst_dir, inst_file)
-            try:
-                result = process_instance(problem, inst_file, inst_path)
-            except Exception as e:
-                print(f"  [{idx+1}/{len(file_list)}] {stem}  ERROR: {e}")
-                continue
+            out_path = os.path.join(OUTPUT_DIR, problem, split_name, f"{stem}.pkl")
+            tasks.append((problem, inst_file, inst_path, out_path))
 
-            if result is None:
-                continue
+        success = 0
+        done = 0
+        total = len(tasks)
 
-            with open(out_path, "wb") as f:
-                pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if workers <= 1:
+            for task in tasks:
+                inst_file, status, info = _worker(task)
+                done += 1
+                stem = os.path.splitext(inst_file)[0]
+                if status == "skip":
+                    success += 1
+                elif status == "ok":
+                    success += 1
+                    n_vars, n_cons, n_edges, elapsed = info
+                    if done % 20 == 0 or done == 1:
+                        print(f"  [{done}/{total}] {stem}  "
+                              f"V={n_vars} C={n_cons} E={n_edges}  {elapsed:.1f}s")
+                elif status == "error":
+                    print(f"  [{done}/{total}] {stem}  ERROR: {info}")
+                else:
+                    print(f"  [{done}/{total}] {stem}  [WARN] skipped (no result)")
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_task = {executor.submit(_worker, t): t for t in tasks}
+                for future in as_completed(future_to_task):
+                    done += 1
+                    inst_file, status, info = future.result()
+                    stem = os.path.splitext(inst_file)[0]
+                    if status == "skip":
+                        success += 1
+                    elif status == "ok":
+                        success += 1
+                        n_vars, n_cons, n_edges, elapsed = info
+                        if done % 20 == 0 or done == 1:
+                            print(f"  [{done}/{total}] {stem}  "
+                                  f"V={n_vars} C={n_cons} E={n_edges}  {elapsed:.1f}s")
+                    elif status == "error":
+                        print(f"  [{done}/{total}] {stem}  ERROR: {info}")
+                    else:
+                        print(f"  [{done}/{total}] {stem}  [WARN] skipped (no result)")
 
-            elapsed = time.time() - t0
-            success += 1
-            if (idx + 1) % 20 == 0 or idx == 0:
-                print(f"  [{idx+1}/{len(file_list)}] {stem}  "
-                      f"V={result['n_vars']} C={result['n_cons']} "
-                      f"E={result['edge_indices'].shape[1]}  "
-                      f"{elapsed:.1f}s")
-
-        print(f"  => {success}/{len(file_list)} saved")
+        print(f"  => {success}/{total} saved")
 
 
 def main():
@@ -317,6 +361,8 @@ def main():
     parser.add_argument("--problems", nargs="+", default=ALL_PROBLEMS,
                         choices=ALL_PROBLEMS, help="Which problems to process")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--workers", type=int, default=os.cpu_count(),
+                        help="Number of parallel worker processes (default: cpu count)")
     args = parser.parse_args()
 
     # Reproducibility
@@ -333,9 +379,10 @@ def main():
     print(f"Output dir   : {OUTPUT_DIR}")
     print(f"Seed         : {args.seed}")
     print(f"Problems     : {args.problems}")
+    print(f"Workers      : {args.workers}")
 
     for prob in args.problems:
-        process_problem(prob, args.seed)
+        process_problem(prob, args.seed, args.workers)
 
     # Save global feature description
     desc_path = os.path.join(OUTPUT_DIR, "feature_description.json")

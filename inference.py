@@ -43,6 +43,11 @@ from model import MILPGNNModel
 
 DEFAULT_SEED = 42
 
+# Problems where higher objective = better (maximisation)
+# True  = minimise (SC, WA)
+# False = maximise (CA, IP, IS)
+MINIMISE_MAP = {"CA": False, "IP": False, "IS": False, "SC": True, "WA": True}
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Feature extraction (mirrors build_dataset.py, no solution required)
@@ -148,14 +153,23 @@ INSTANCE_DIR = "/home/lmh/autodl-tmp/data/l2o_milp"
 #  Model loading & inference
 # ══════════════════════════════════════════════════════════════════════════
 
-def load_model(checkpoint_path, device):
-    """Load trained model from checkpoint."""
+def load_model(checkpoint_path, device, n_probes_override=None):
+    """Load trained model from checkpoint.
+
+    Parameters
+    ----------
+    n_probes_override : int or None
+        If given, overrides the n_probes (M) value stored in the checkpoint.
+        Useful for experimenting with a different number of macro probes at
+        inference time without retraining.
+    """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get("cfg", {})
+    n_probes = n_probes_override if n_probes_override is not None else cfg.get("n_probes", 16)
     model = MILPGNNModel(
         hidden_dim=cfg.get("hidden_dim", 64),
         n_gcn_layers=cfg.get("n_gcn_layers", 2),
-        n_probes=cfg.get("n_probes", 16),
+        n_probes=n_probes,
         dropout=cfg.get("dropout", 0.1),
     ).to(device)
     model.load_state_dict(ckpt["model"])
@@ -435,6 +449,14 @@ def export_problem(gnn_model, problem, args, device):
         cf = torch.tensor(data["con_feats"],    dtype=torch.float32, device=device)
         ei = torch.tensor(data["edge_indices"], dtype=torch.long,    device=device)
         ev = torch.tensor(data["edge_values"],  dtype=torch.float32, device=device)
+
+        # Unify to minimisation convention (mirrors MILPDataset in train.py):
+        # negate col 0 (normalised obj) and col 20 (raw obj) for max problems.
+        if not MINIMISE_MAP.get(problem, True):
+            vf = vf.clone()
+            vf[:, 0]  = -vf[:, 0]
+            vf[:, 20] = -vf[:, 20]
+
         t1 = time.time()
         feat_time = t1 - t0
 
@@ -523,6 +545,9 @@ def main():
                              "Uses --fix_threshold to decide which vars to fix.")
     parser.add_argument("--fix_threshold", type=float, default=0.97,
                         help="Confidence threshold for --fix_vars mode (default 0.97).")
+    parser.add_argument("--n_probes", type=int, default=None,
+                        help="Number of macro probe vectors M in Q_macro [M, d]. "
+                             "If not set, uses the value stored in the checkpoint.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir",
                         default=os.path.join(SCRIPT_DIR, "output"),
@@ -541,11 +566,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    model, cfg = load_model(args.checkpoint, device)
+    model, cfg = load_model(args.checkpoint, device, n_probes_override=args.n_probes)
     print(f"Model loaded from {args.checkpoint}")
+    n_probes_actual = args.n_probes if args.n_probes is not None else cfg.get("n_probes", 16)
     print(f"  hidden_dim={cfg.get('hidden_dim', 64)}  "
           f"n_gcn_layers={cfg.get('n_gcn_layers', 2)}  "
-          f"n_probes={cfg.get('n_probes', 16)}")
+          f"n_probes={n_probes_actual}"
+          + (" (overridden)" if args.n_probes is not None else ""))
 
     os.makedirs(args.output_dir, exist_ok=True)
 

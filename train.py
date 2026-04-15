@@ -109,6 +109,7 @@ DEFAULTS = {
     "w_viol": 0.1,
     "w_recon": 0.0,
     "w_orth": 0.0,
+    "w_entropy": 0.0,
     # LP skip connection initial trust
     "lp_gate_bias": 2.0,
     # Validation metric for early stopping
@@ -135,17 +136,32 @@ class MILPDataset:
         with open(self.files[idx], "rb") as f:
             d = pickle.load(f)
         prob = self.prob_types[idx]
+        minimise = MINIMISE_MAP.get(prob, True)
+
+        var_feats = torch.as_tensor(d["var_feats"], dtype=torch.float32)
+        objs      = torch.as_tensor(d["objs"],      dtype=torch.float32)
+
+        # Unify to minimisation: negate objective-related features for max problems.
+        # Col 0 : ecole-normalised obj coefficient
+        # Col 20: raw (un-normalised) obj coefficient  (used in obj-quality penalty)
+        # objs  : negate so argmin always selects the best solution
+        if not minimise:
+            var_feats = var_feats.clone()
+            var_feats[:, 0]  = -var_feats[:, 0]
+            var_feats[:, 20] = -var_feats[:, 20]
+            objs = -objs
+
         return {
-            "var_feats":   torch.as_tensor(d["var_feats"],   dtype=torch.float32),
+            "var_feats":   var_feats,
             "con_feats":   torch.as_tensor(d["con_feats"],   dtype=torch.float32),
             "edge_indices": torch.as_tensor(d["edge_indices"], dtype=torch.long),
             "edge_values": torch.as_tensor(d["edge_values"], dtype=torch.float32),
             "sols":        torch.as_tensor(d["sols"],        dtype=torch.float32),
-            "objs":        torch.as_tensor(d["objs"],        dtype=torch.float32),
+            "objs":        objs,
             "n_vars":      d["n_vars"],
             "n_cons":      d["n_cons"],
             "instance_id": os.path.basename(self.files[idx]),
-            "minimise":    MINIMISE_MAP.get(prob, True),
+            "minimise":    True,   # always minimise after sign flip
         }
 
 
@@ -437,6 +453,8 @@ def main():
                         help="Fixed weight for reconstruction loss (0 = disabled).")
     parser.add_argument("--w_orth", type=float, default=0.0,
                         help="Fixed weight for orthogonality loss (0 = disabled).")
+    parser.add_argument("--w_entropy", type=float, default=0.0,
+                        help="Fixed weight for binary entropy regulariser (0 = disabled).")
     parser.add_argument("--lp_gate_bias", type=float, default=2.0,
                         help="Initial bias for LP skip-connection gate. "
                              "sigmoid(bias) sets initial LP trust: "
@@ -493,7 +511,7 @@ def main():
         w_viol=cfg["w_viol"],
         w_recon=cfg["w_recon"],
         w_orth=cfg["w_orth"],
-        w_entropy=0.0,
+        w_entropy=cfg["w_entropy"],
     ).to(device)
     balancer = base_loss   # alias — fixed weights, no learnable balancer
 
@@ -560,7 +578,7 @@ def main():
         for k, v in train_m.items():
             writer.add_scalar(f"train/{k}", v, epoch)
         w = {"sup": cfg["w_sup"], "viol": cfg["w_viol"],
-             "recon": cfg["w_recon"], "orth": cfg["w_orth"], "entropy": 0.0}
+             "recon": cfg["w_recon"], "orth": cfg["w_orth"], "entropy": cfg["w_entropy"]}
         for k, v in w.items():
             writer.add_scalar(f"weights/{k}", v, epoch)
         writer.add_scalar("lagrangian/mean_lambda", lag_mgr.mean_lambda(), epoch)
@@ -652,7 +670,7 @@ def main():
             epoch_log_fh.flush()
 
         # periodic checkpoint
-        if (epoch + 1) % 50 == 0:
+        if (epoch + 1) % 1000 == 0:
             save_checkpoint(
                 os.path.join(run_path, f"epoch_{epoch+1:03d}.pt"),
                 model, optimizer, scheduler, balancer, lag_mgr,
