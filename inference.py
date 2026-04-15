@@ -143,7 +143,7 @@ def load_or_extract_features(inst_file: str, cache_path: str):
 
 # ── Default delta per problem (from baseline) ─────────────────────────────
 DEFAULT_DELTA = {
-    "CA": 40, "IP": 55, "IS": 40, "SC": 200, "WA": 100,
+    "CA": 80, "IP": 55, "IS": 40, "SC": 200, "WA": 100,
 }
 
 INSTANCE_DIR = "/home/lmh/autodl-tmp/data/l2o_milp"
@@ -384,6 +384,95 @@ def _iter_split_instances(split_dir: str, inst_dir: str, cache_dir: str):
         yield stem, inst_file, cache_path
 
 
+def compute_topk_rounding_accuracy(pred_info, data, problem, k=500):
+    """
+    Compute rounding accuracy for the top-K most confident variables,
+    comparing rounded predictions against the best solution among the
+    50 stored solutions in the .pkl file.
+
+    For binary variables: confidence = |P(x=1) - 0.5| * 2
+    For integer variables: confidence = 1 - 2 * frac
+
+    The best solution is chosen by objective value (min or max depending
+    on MINIMISE_MAP).
+
+    Parameters
+    ----------
+    pred_info : dict   output from GNN inference
+    data      : dict   loaded .pkl data (must contain 'sols' and 'objs')
+    problem   : str    problem type (for MINIMISE_MAP lookup)
+    k         : int    number of top-confidence variables to evaluate
+
+    Returns
+    -------
+    accuracy  : float  fraction of top-K vars whose rounded prediction
+                       matches the best solution, or None if no solutions
+    n_topk    : int    actual number of variables evaluated (min(K, total_int_vars))
+    """
+    if "sols" not in data or "objs" not in data:
+        return None, 0
+
+    sols = data["sols"]   # (n_sols, n_vars)
+    objs = data["objs"]   # (n_sols,)
+    if sols.shape[0] == 0:
+        return None, 0
+
+    # Pick best solution
+    minimise = MINIMISE_MAP.get(problem, True)
+    best_idx = int(np.argmin(objs) if minimise else np.argmax(objs))
+    best_sol = sols[best_idx]   # (n_vars,)
+
+    var_feats   = pred_info["var_feats"]
+    binary_prob = pred_info["binary_prob"]
+    integer_mu  = pred_info["integer_mu"]
+
+    is_bin = var_feats[:, 1].astype(bool)
+    is_int = var_feats[:, 2].astype(bool) | var_feats[:, 3].astype(bool)
+
+    # Build arrays of (var_index, confidence, predicted_rounded, ground_truth)
+    conf_list  = []
+    pred_list  = []
+    truth_list = []
+
+    bin_indices = np.where(is_bin)[0]
+    if len(bin_indices) > 0:
+        probs     = binary_prob[bin_indices]
+        conf_bin  = np.abs(probs - 0.5) * 2.0
+        pred_bin  = (probs > 0.5).astype(float)
+        truth_bin = best_sol[bin_indices]
+        for j in range(len(bin_indices)):
+            conf_list.append(conf_bin[j])
+            pred_list.append(pred_bin[j])
+            truth_list.append(truth_bin[j])
+
+    int_indices = np.where(is_int)[0]
+    if len(int_indices) > 0:
+        mu        = integer_mu[int_indices]
+        rounded   = np.round(mu)
+        frac      = np.abs(mu - rounded)
+        conf_int  = 1.0 - np.clip(frac, 0.0, 0.5) * 2.0
+        truth_int = best_sol[int_indices]
+        for j in range(len(int_indices)):
+            conf_list.append(conf_int[j])
+            pred_list.append(rounded[j])
+            truth_list.append(truth_int[j])
+
+    if len(conf_list) == 0:
+        return None, 0
+
+    conf_arr  = np.array(conf_list)
+    pred_arr  = np.array(pred_list)
+    truth_arr = np.array(truth_list)
+
+    # Take top-K by confidence
+    actual_k = min(k, len(conf_arr))
+    topk_idx = np.argsort(conf_arr)[-actual_k:]
+
+    correct  = np.sum(pred_arr[topk_idx] == truth_arr[topk_idx])
+    accuracy = float(correct) / actual_k
+    return accuracy, actual_k
+
+
 def export_problem(gnn_model, problem, args, device):
     """
     For each instance of `problem`:
@@ -428,6 +517,7 @@ def export_problem(gnn_model, problem, args, device):
     sum_feat = sum_infer = sum_total = 0.0
     sum_bin = sum_int = 0
     count = 0
+    topk_acc_list = []   # collects per-instance top-K accuracy (float or None)
 
     for i, (stem, inst_file, cache_path) in enumerate(instances):
         if inst_file is None:
@@ -474,6 +564,13 @@ def export_problem(gnn_model, problem, args, device):
         t2 = time.time()
         infer_time = t2 - t1
 
+        # ---- 2b. Top-K rounding accuracy vs. best of 50 solutions ----
+        topk_acc, n_topk = compute_topk_rounding_accuracy(
+            pred_info, data, problem, k=args.topk
+        )
+        if topk_acc is not None:
+            topk_acc_list.append(topk_acc)
+
         # ---- 3. Add trust-region constraints & export ----
         model, n_bin, n_int = build_trust_region_instance(
             inst_file, pred_info, delta,
@@ -494,11 +591,12 @@ def export_problem(gnn_model, problem, args, device):
         sum_int   += n_int
         count += 1
 
+        acc_str = f"  top{args.topk}_acc={topk_acc:.4f}(n={n_topk})" if topk_acc is not None else ""
         print(f"  [{i+1:>3d}/{len(instances)}] {stem}  "
               f"[{cache_tag}]  "
               f"n_bin={n_bin}  n_int={n_int}  delta={delta}  "
               f"feat={feat_time:.3f}s  infer={infer_time:.3f}s  "
-              f"total={total_time:.3f}s  -> {os.path.basename(out_path)}")
+              f"total={total_time:.3f}s{acc_str}  -> {os.path.basename(out_path)}")
 
     if count > 0:
         thr = args.fix_threshold if args.fix_vars else args.conf_threshold
@@ -508,6 +606,11 @@ def export_problem(gnn_model, problem, args, device):
         print(f"    Vars in threshold  : "
               f"avg_bin={sum_bin/count:.1f}  avg_int={sum_int/count:.1f}  "
               f"avg_total={(sum_bin+sum_int)/count:.1f}")
+        if topk_acc_list:
+            mean_acc = float(np.mean(topk_acc_list))
+            print(f"    Top-{args.topk} rounding acc : "
+                  f"mean={mean_acc:.4f}  "
+                  f"({len(topk_acc_list)}/{count} instances with solutions)")
         print(f"    Feature extraction : total={sum_feat:.3f}s  "
               f"avg={sum_feat/count:.3f}s")
         print(f"    GNN inference      : total={sum_infer:.3f}s  "
@@ -548,6 +651,10 @@ def main():
     parser.add_argument("--n_probes", type=int, default=None,
                         help="Number of macro probe vectors M in Q_macro [M, d]. "
                              "If not set, uses the value stored in the checkpoint.")
+    parser.add_argument("--topk", type=int, default=500,
+                        help="Evaluate rounding accuracy on the top-K most confident "
+                             "variables (binary + integer), compared against the best "
+                             "of the 50 stored solutions (default: 500).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir",
                         default=os.path.join(SCRIPT_DIR, "output"),
