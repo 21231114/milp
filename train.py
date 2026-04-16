@@ -455,6 +455,10 @@ def main():
                         help="Fixed weight for orthogonality loss (0 = disabled).")
     parser.add_argument("--w_entropy", type=float, default=0.0,
                         help="Fixed weight for binary entropy regulariser (0 = disabled).")
+    parser.add_argument("--sup_loss_type", type=str, default="default",
+                        choices=["default", "mse"],
+                        help="Supervised loss type: 'default' uses BCE/NLL/MSE per variable "
+                             "type; 'mse' uses MSE for all variable types.")
     parser.add_argument("--lp_gate_bias", type=float, default=2.0,
                         help="Initial bias for LP skip-connection gate. "
                              "sigmoid(bias) sets initial LP trust: "
@@ -512,6 +516,7 @@ def main():
         w_recon=cfg["w_recon"],
         w_orth=cfg["w_orth"],
         w_entropy=cfg["w_entropy"],
+        sup_loss_type=cfg["sup_loss_type"],
     ).to(device)
     balancer = base_loss   # alias — fixed weights, no learnable balancer
 

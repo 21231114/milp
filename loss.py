@@ -81,6 +81,8 @@ class MILPCompositeLoss(nn.Module):
     type_w_int       : float  base weight for integer vars            (0.8)
     type_w_cont      : float  weight for continuous vars              (0.3)
     minimise         : bool   fallback when data has no minimise key  (True)
+    sup_loss_type    : str    supervised loss type: 'default' (BCE/NLL/MSE per
+                              variable type) or 'mse' (MSE for all types)  ('default')
     """
 
     def __init__(self, hidden_dim: int,
@@ -93,7 +95,8 @@ class MILPCompositeLoss(nn.Module):
                  type_w_bin: float = 1.0,
                  type_w_int: float = 0.8,
                  type_w_cont: float = 0.3,
-                 minimise: bool = True):
+                 minimise: bool = True,
+                 sup_loss_type: str = "default"):
         super().__init__()
         self.w_sup = w_sup
         self.w_viol = w_viol
@@ -105,6 +108,9 @@ class MILPCompositeLoss(nn.Module):
         self.type_w_int = type_w_int
         self.type_w_cont = type_w_cont
         self.minimise = minimise
+        if sup_loss_type not in ("default", "mse"):
+            raise ValueError(f"sup_loss_type must be 'default' or 'mse', got '{sup_loss_type}'")
+        self.sup_loss_type = sup_loss_type
 
         # LayerNorm used in reconstruction loss
         self.recon_norm = nn.LayerNorm(hidden_dim)
@@ -148,23 +154,29 @@ class MILPCompositeLoss(nn.Module):
         # 不再有 K 维度，直接计算一维 [N] 的损失
         per_var_loss = torch.zeros(N, device=device)
 
-        if is_bin.any():
-            logits = model_out["binary_logits"][is_bin]
-            targets = best_sol[is_bin]
-            targets = targets * (1.0 - eps) + 0.5 * eps        # label smoothing
-            per_var_loss[is_bin] = F.binary_cross_entropy_with_logits(
-                logits, targets, reduction="none")
+        if self.sup_loss_type == "mse":
+            # MSE for all variable types
+            pred = model_out["pred"]
+            per_var_loss = F.mse_loss(pred, best_sol, reduction="none")
+        else:
+            # Default: type-aware losses (BCE / NLL / MSE)
+            if is_bin.any():
+                logits = model_out["binary_logits"][is_bin]
+                targets = best_sol[is_bin]
+                targets = targets * (1.0 - eps) + 0.5 * eps        # label smoothing
+                per_var_loss[is_bin] = F.binary_cross_entropy_with_logits(
+                    logits, targets, reduction="none")
 
-        if is_int.any():
-            mu  = model_out["integer_mu"][is_int]
-            lsd = model_out["integer_log_std"][is_int]
-            per_var_loss[is_int] = -PredictionHead.integer_log_prob(
-                mu, lsd, best_sol[is_int])
+            if is_int.any():
+                mu  = model_out["integer_mu"][is_int]
+                lsd = model_out["integer_log_std"][is_int]
+                per_var_loss[is_int] = -PredictionHead.integer_log_prob(
+                    mu, lsd, best_sol[is_int])
 
-        if is_cont.any():
-            val = model_out["continuous_val"][is_cont]
-            per_var_loss[is_cont] = F.mse_loss(
-                val, best_sol[is_cont], reduction="none")
+            if is_cont.any():
+                val = model_out["continuous_val"][is_cont]
+                per_var_loss[is_cont] = F.mse_loss(
+                    val, best_sol[is_cont], reduction="none")
 
         # 变量加权平均即可，不再需要对多解进行 Boltzmann 加权
         return (per_var_loss * var_w).mean()
